@@ -2,8 +2,15 @@ import maplibregl, { Map as MlMap, Marker } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './styles.css';
 
-import { makeAoi, makeCoverageGrid, radialParams, type Aoi, type CoverageGrid } from './geo/aoi.js';
-import { bboxCovers } from './geo/bbox.js';
+import {
+  aoiKey,
+  makeAoi,
+  makeCoverageGrid,
+  radialParams,
+  siteNeedsNewAoi,
+  type Aoi,
+  type CoverageGrid,
+} from './geo/aoi.js';
 import { toUtm } from './geo/utm.js';
 import { EngineClient } from './engine/client.js';
 import { DEFAULT_K_FACTOR, type SiteGrid, type TerrainGridSpec } from './engine/types.js';
@@ -38,9 +45,13 @@ interface Ctx {
   corners: Corners | null;
   coverage: CoverageGrid | null;
   grids: Map<string, SiteGrid>;
+  /** Per-site hash of every propagation input, so unchanged sites are not recomputed. */
+  signatures: Map<string, string>;
   kpiValues: Float32Array | null;
   rgba: Uint8ClampedArray<ArrayBuffer> | null;
   demRgba: Uint8ClampedArray<ArrayBuffer> | null;
+  /** Identity of the AOI currently loaded, so a redundant trigger cannot refetch. */
+  loadedKey: string | null;
 }
 
 const ctx: Ctx = {
@@ -50,9 +61,11 @@ const ctx: Ctx = {
   corners: null,
   coverage: null,
   grids: new Map(),
+  signatures: new Map(),
   kpiValues: null,
   rgba: null,
   demRgba: null,
+  loadedKey: null,
 };
 
 const store = createStore<AppState>(DEFAULT_STATE, STAGE_FOR);
@@ -100,6 +113,13 @@ store.on('data', async (s) => {
   if (!s.aoiCenter) return;
 
   const aoi = makeAoi(s.aoiCenter, s.aoiSideM);
+
+  // Nothing about the area actually changed, so there is nothing to fetch. The stage table
+  // should already prevent this, but network access is the one thing worth guarding twice:
+  // a future caller that sets aoiCenter redundantly must not be able to cause a download.
+  const key = aoiKey(aoi);
+  if (key === ctx.loadedKey && ctx.terrain) return;
+
   ctx.aoi = aoi;
   ctx.corners = aoiCorners(aoi.bbox, aoi.zone);
 
@@ -125,6 +145,7 @@ store.on('data', async (s) => {
   ctx.terrain = terrain;
   ctx.clutter = clutter;
   ctx.demRgba = null;
+  ctx.loadedKey = key;
 
   await engine.setTerrain(terrain, demSpec(aoi));
   controls.setStatus(
@@ -143,11 +164,41 @@ store.on('propagation', async (s) => {
   ctx.coverage = coverage;
   const rp = radialParams(aoi, coverage.binM);
 
-  ctx.grids.clear();
+  // Forget sites that no longer exist, but keep the rest -- recomputing every site whenever
+  // any one of them changes is exactly the waste this stage exists to avoid. With eight
+  // sites, nudging one frequency would otherwise pay for eight radial walks.
+  const liveIds = new Set(s.sites.filter((x) => x.enabled).map((x) => x.id));
+  for (const id of [...ctx.grids.keys()]) {
+    if (!liveIds.has(id)) {
+      ctx.grids.delete(id);
+      ctx.signatures.delete(id);
+    }
+  }
+
   const t0 = performance.now();
+  let computed = 0;
+  let reused = 0;
 
   for (const site of s.sites) {
     if (!site.enabled) continue;
+
+    // Everything the radial walk depends on. If none of it moved, the cached grid is still
+    // exactly correct -- note EIRP is absent, because it belongs to the link budget.
+    const signature = [
+      aoiKey(aoi),
+      coverage.binM,
+      s.rxHeightM,
+      site.lon,
+      site.lat,
+      site.txHeightM,
+      site.freqMHz,
+    ].join('|');
+
+    if (ctx.signatures.get(site.id) === signature && ctx.grids.has(site.id)) {
+      reused++;
+      continue;
+    }
+
     const p = toUtm({ lon: site.lon, lat: site.lat }, aoi.zone);
     const out = await engine.compute(
       site.id,
@@ -170,13 +221,21 @@ store.on('propagation', async (s) => {
         binM: coverage.binM,
       },
     );
-    ctx.grids.set(site.id, out);
+    // null means a newer request for this site superseded ours, or the worker errored.
+    // Leave the signature unset either way, so the next pass retries rather than caching
+    // a result that was never stored.
+    if (out) {
+      ctx.grids.set(site.id, out);
+      ctx.signatures.set(site.id, signature);
+      computed++;
+    }
   }
 
   const ms = Math.round(performance.now() - t0);
   controls.setStatus(
     `${coverage.size.width}x${coverage.size.height} bins at ${coverage.binM.toFixed(0)} m · ` +
-      `${rp.nRadials} radials x ${rp.nSteps} steps · ${ms} ms`,
+      `${rp.nRadials} radials x ${rp.nSteps} steps · ` +
+      `${computed} computed${reused ? `, ${reused} reused` : ''} · ${ms} ms`,
   );
 });
 
@@ -286,14 +345,13 @@ function placeOrMoveSite(lon: number, lat: number): void {
   const sites = s.sites.map((x) => (x.id === moved.id ? moved : x));
   markers.get(moved.id)?.setLngLat([lon, lat]);
 
-  // Only refetch when the site actually leaves the loaded area -- otherwise moving a
-  // transmitter is a Class 2 recompute and stays interactive during the drag.
+  // The AOI is a study area, not a follow-cam. Terrain is loaded for the whole box, so a
+  // site moving anywhere inside it is a Class 2 recompute with no network access at all --
+  // only a site pushed out to the edge earns a reload.
   const aoi = ctx.aoi;
   if (aoi) {
     const p = toUtm({ lon, lat }, aoi.zone);
-    const half = s.aoiSideM / 2;
-    const needed = { minE: p.e - half, minN: p.n - half, maxE: p.e + half, maxN: p.n + half };
-    if (bboxCovers(aoi.bbox, needed)) {
+    if (!siteNeedsNewAoi(aoi, p.e, p.n)) {
       store.set({ sites }, 'propagation');
       return;
     }

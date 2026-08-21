@@ -70,6 +70,38 @@ export function makeCoverageGrid(aoi: Aoi, binM: number): CoverageGrid {
   return { bbox: aoi.bbox, size: { width: n, height: n }, binM: aoi.sideM / n };
 }
 
+/**
+ * How far inside the AOI edge a site must stay before we reload the area.
+ *
+ * The AOI is a *study area*, not a follow-cam: terrain is fetched for the whole box, so a
+ * site moving anywhere inside it needs no new data at all. The margin exists only so a site
+ * dragged hard against the edge -- where most of its coverage would fall outside the loaded
+ * box -- recentres rather than rendering a mostly empty map.
+ */
+export const AOI_EDGE_MARGIN = 0.1;
+
+/**
+ * True when a site has moved far enough that the AOI should be reloaded around it.
+ *
+ * Note what this deliberately does NOT ask: whether a full-size AOI centred on the new
+ * position fits inside the current one. That can only be true when the site has not moved,
+ * so using it would refetch on every drag.
+ */
+export function siteNeedsNewAoi(aoi: Aoi, e: number, n: number, margin = AOI_EDGE_MARGIN): boolean {
+  const inset = aoi.sideM * margin;
+  return (
+    e < aoi.bbox.minE + inset ||
+    e > aoi.bbox.maxE - inset ||
+    n < aoi.bbox.minN + inset ||
+    n > aoi.bbox.maxN - inset
+  );
+}
+
+/** Identity of a fetched AOI, so the data stage can skip work when nothing actually moved. */
+export function aoiKey(aoi: Aoi): string {
+  return `${aoi.zone.epsg}|${Math.round(aoi.bbox.minE)},${Math.round(aoi.bbox.maxN)}|${aoi.size.width}x${aoi.size.height}|${aoi.resM.toFixed(3)}`;
+}
+
 export interface RadialParams {
   nRadials: number;
   nSteps: number;

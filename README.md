@@ -69,6 +69,21 @@ This is also why there is no UI framework here. The hot path is typed arrays and
 DOM, MapLibre is imperative regardless — and React has no way to express that `opacity` is
 free while `freqMHz` costs 80 ms.
 
+### What gets reused rather than recomputed
+
+Staging decides *where* work restarts; three caches decide how much of it is real work:
+
+| Cache | Key | Effect |
+|---|---|---|
+| IndexedDB raster cache | provider + bbox + size + EPSG | A revisited area never re-downloads |
+| Loaded-AOI guard | `aoiKey(aoi)` | A redundant `data` trigger cannot cause a fetch |
+| Per-site signature | AOI + bin + RX height + site position, height, frequency | Only sites whose propagation inputs actually changed are re-walked |
+
+The AOI is a **study area, not a follow-cam**: terrain is fetched for the whole box, so a
+site moving anywhere inside it costs no network access at all. Only a site pushed out past
+the edge margin reloads the area. EIRP is deliberately absent from the site signature —
+it belongs to the link budget, so changing it never re-walks a radial.
+
 ## Deployment
 
 Static hosting on Vercel (`vercel.json`); the build is a plain `dist/` folder, so any static

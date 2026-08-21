@@ -17,7 +17,7 @@ export class EngineClient {
   private worker: Worker;
   private nextId = 1;
   private latestPerSite = new Map<string, number>();
-  private pending = new Map<number, (r: ComputeOutcome) => void>();
+  private pending = new Map<number, (r: ComputeOutcome | null) => void>();
   private terrainReady: Promise<void>;
   private resolveTerrain: (() => void) | null = null;
   private onError: (msg: string) => void;
@@ -37,15 +37,24 @@ export class EngineClient {
       return;
     }
     if (msg.type === 'error') {
+      const reject = this.pending.get(msg.reqId);
       this.pending.delete(msg.reqId);
       this.onError(msg.message);
+      // Settle even on failure, or the pipeline stage awaiting this never returns and the
+      // store's `running` guard blocks every later change permanently.
+      reject?.(null);
       return;
     }
     const resolve = this.pending.get(msg.reqId);
     this.pending.delete(msg.reqId);
     if (!resolve) return;
-    // Drop results that a newer request for the same site has already superseded.
-    if (this.latestPerSite.get(msg.siteId) !== msg.reqId) return;
+
+    // A newer request for this site has superseded this result. Resolve with null rather
+    // than dropping it: an unsettled promise here would deadlock the pipeline.
+    if (this.latestPerSite.get(msg.siteId) !== msg.reqId) {
+      resolve(null);
+      return;
+    }
 
     resolve({
       siteId: msg.siteId,
@@ -68,12 +77,17 @@ export class EngineClient {
     return this.terrainReady;
   }
 
-  async compute(siteId: string, params: ComputeParams, grid: GridSpec): Promise<ComputeOutcome> {
+  /** Resolves to `null` when superseded by a newer request for the same site, or on error. */
+  async compute(
+    siteId: string,
+    params: ComputeParams,
+    grid: GridSpec,
+  ): Promise<ComputeOutcome | null> {
     await this.terrainReady;
     const reqId = this.nextId++;
     this.latestPerSite.set(siteId, reqId);
     const req: WorkerRequest = { type: 'compute', reqId, siteId, params, grid };
-    return new Promise<ComputeOutcome>((resolve) => {
+    return new Promise<ComputeOutcome | null>((resolve) => {
       this.pending.set(reqId, resolve);
       this.worker.postMessage(req);
     });
