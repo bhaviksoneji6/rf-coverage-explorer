@@ -4,7 +4,9 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "types": ["vite/client"],
+    // "node" is here for scripts/, which runs outside the browser. Application code under
+    // src/ must not reach for Node APIs -- nothing in the bundle can use them.
+    "types": ["vite/client", "node"],
 
     "strict": true,
     "noUncheckedIndexedAccess": true,
