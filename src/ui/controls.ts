@@ -1,6 +1,7 @@
 import { RAMP_LABELS, type RampName } from '../render/colormap.js';
 import type { Stage, Store } from '../store/store.js';
 import type { AppState, KpiName, Site } from '../store/types.js';
+import { parseFieldValue } from './parseValue.js';
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -15,46 +16,112 @@ function el<K extends keyof HTMLElementTagNameMap>(
 
 interface SliderSpec {
   label: string;
+  /** Bounds and step are in model units, not display units. */
   min: number;
   max: number;
   step: number;
   value: number;
-  format: (v: number) => string;
+  unit: string;
+  decimals?: number;
+  /** Model -> display, e.g. metres shown as km, or 0..1 opacity shown as a percentage. */
+  toDisplay?: (v: number) => number;
+  fromDisplay?: (v: number) => number;
+  /**
+   * 'input' fires continuously while dragging; 'release' waits for the drag to end.
+   *
+   * Class 0-2 controls are cheap enough to drag live, which is the whole point of the stage
+   * table. Class 3 is not: dragging the AOI size would queue a 1.6 s refetch per frame, so
+   * it commits on release and the readout tracks the thumb in the meantime.
+   */
+  commitOn?: 'input' | 'release';
   onInput: (v: number) => void;
 }
 
 /**
- * Sliders, not number fields.
+ * A slider paired with a directly editable readout.
  *
- * Every control here re-enters the pipeline at a stage cheap enough to survive being
- * dragged continuously -- that is the point of the stage table in `store/types.ts`. A
- * control that needed a submit button would be a sign something is mis-classified.
+ * The slider is for exploring; the number field is for landing on a specific value. A step
+ * coarse enough to drag comfortably (10 MHz) cannot reach 2412 MHz, so typed entry is
+ * deliberately NOT snapped to the step grid -- it only has to respect the bounds.
+ *
+ * Typing commits on Enter or blur rather than per keystroke: the field is used for the
+ * expensive Class 2 and Class 3 controls too, and firing a refetch on every digit of "3700"
+ * would kick off four of them.
  */
 function slider(spec: SliderSpec): { root: HTMLElement; sync: (v: number) => void } {
+  const decimals = spec.decimals ?? 0;
+  const toDisplay = spec.toDisplay ?? ((v: number) => v);
+  const fromDisplay = spec.fromDisplay ?? ((v: number) => v);
+  const show = (v: number) => toDisplay(v).toFixed(decimals);
+
   const root = el('div', 'ctrl');
   const label = el('label');
-  const name = el('span', undefined, spec.label);
-  const val = el('span', 'val', spec.format(spec.value));
-  label.append(name, val);
+  label.append(el('span', undefined, spec.label));
 
-  const input = el('input');
-  input.type = 'range';
-  input.min = String(spec.min);
-  input.max = String(spec.max);
-  input.step = String(spec.step);
-  input.value = String(spec.value);
-  input.addEventListener('input', () => {
-    const v = Number(input.value);
-    val.textContent = spec.format(v);
+  const valWrap = el('span', 'val');
+  const num = el('input', 'numval');
+  num.type = 'text';
+  num.inputMode = 'decimal';
+  num.value = show(spec.value);
+  num.setAttribute('aria-label', `${spec.label} value in ${spec.unit || 'units'}`);
+  valWrap.append(num);
+  if (spec.unit) valWrap.append(el('span', 'unit', spec.unit));
+  label.append(valWrap);
+
+  const range = el('input');
+  range.type = 'range';
+  range.min = String(spec.min);
+  range.max = String(spec.max);
+  range.step = String(spec.step);
+  range.value = String(spec.value);
+  // The wrapping <label> associates with the number field, so the slider needs its own name.
+  range.setAttribute('aria-label', spec.label);
+
+  const live = (spec.commitOn ?? 'input') === 'input';
+  range.addEventListener('input', () => {
+    const v = Number(range.value);
+    num.value = show(v);
+    if (live) spec.onInput(v);
+  });
+  if (!live) {
+    range.addEventListener('change', () => spec.onInput(Number(range.value)));
+  }
+
+  const commit = (): void => {
+    const v = parseFieldValue(num.value, { min: spec.min, max: spec.max, fromDisplay });
+    if (v === null) {
+      // Unparseable: put the previous value back rather than pushing NaN into the pipeline.
+      num.value = show(Number(range.value));
+      return;
+    }
+    range.value = String(v);
+    num.value = show(v);
     spec.onInput(v);
+  };
+
+  num.addEventListener('change', commit);
+  num.addEventListener('focus', () => num.select());
+  // Without this the mouse-up that follows focus drops the selection and just places a
+  // caret, so "click the number and type" would append instead of replace.
+  num.addEventListener('mouseup', (ev) => ev.preventDefault());
+  num.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      num.blur();
+    } else if (ev.key === 'Escape') {
+      num.value = show(Number(range.value));
+      num.blur();
+    }
   });
 
-  root.append(label, input);
+  root.append(label, range);
   return {
     root,
     sync: (v: number) => {
-      input.value = String(v);
-      val.textContent = spec.format(v);
+      range.value = String(v);
+      // The render stage calls sync on every pass. Rewriting the field while it has focus
+      // would overwrite whatever is half-typed, so leave it alone until the user is done.
+      if (document.activeElement !== num) num.value = show(v);
     },
   };
 }
@@ -115,39 +182,43 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
   const txGroup = group('Transmitter', 'recompute');
   const freq = slider({
     label: 'Frequency',
-    min: 100,
+    min: 30,
     max: 6000,
     step: 10,
     value: 3700,
-    format: (v) => `${v} MHz`,
+    unit: 'MHz',
+    // The 10 MHz step is a comfortable drag; type to land on 2412, 3550, 5925 and friends.
     onInput: (v) => updateSelected({ freqMHz: v }, 'propagation'),
   });
   const txh = slider({
     label: 'TX height',
-    min: 3,
-    max: 150,
+    min: 1,
+    max: 300,
     step: 1,
     value: 30,
-    format: (v) => `${v} m`,
+    unit: 'm',
+    decimals: 1,
     onInput: (v) => updateSelected({ txHeightM: v }, 'propagation'),
   });
   const eirp = slider({
     label: 'EIRP',
-    min: 0,
-    max: 80,
+    min: -20,
+    max: 90,
     step: 0.5,
     value: 55,
-    format: (v) => `${v.toFixed(1)} dBm`,
+    unit: 'dBm',
+    decimals: 1,
     // Class 1: path loss is unchanged, only the level derived from it.
     onInput: (v) => updateSelected({ eirpDbm: v }, 'linkBudget'),
   });
   const rxh = slider({
     label: 'RX height',
-    min: 1,
-    max: 50,
+    min: 0.5,
+    max: 100,
     step: 0.5,
     value: s.rxHeightM,
-    format: (v) => `${v.toFixed(1)} m`,
+    unit: 'm',
+    decimals: 1,
     onInput: (v) => store.set({ rxHeightM: v }),
   });
   txGroup.append(freq.root, txh.root, eirp.root, rxh.root);
@@ -157,20 +228,26 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
   const areaGroup = group('Area', 'refetch');
   const side = slider({
     label: 'AOI size',
-    min: 10000,
-    max: 60000,
-    step: 5000,
+    min: 2000,
+    max: 100000,
+    step: 1000,
     value: s.aoiSideM,
-    format: (v) => `${v / 1000} km`,
+    unit: 'km',
+    decimals: 1,
+    // Stored in metres, shown in km -- the field edits km and converts back.
+    toDisplay: (v) => v / 1000,
+    fromDisplay: (v) => v * 1000,
+    // Class 3: every commit is a network refetch, so wait for the drag to finish.
+    commitOn: 'release',
     onInput: (v) => store.set({ aoiSideM: v }),
   });
   const bin = slider({
     label: 'Bin size',
-    min: 25,
-    max: 200,
-    step: 25,
+    min: 10,
+    max: 500,
+    step: 5,
     value: s.binM,
-    format: (v) => `${v} m`,
+    unit: 'm',
     onInput: (v) => store.set({ binM: v }),
   });
   areaGroup.append(side.root, bin.root);
@@ -198,11 +275,12 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
 
   const thr = slider({
     label: 'Threshold',
-    min: -140,
-    max: -40,
+    min: -160,
+    max: 0,
     step: 1,
     value: s.threshold,
-    format: (v) => `${v} dBm`,
+    unit: 'dBm',
+    decimals: 1,
     onInput: (v) => store.set({ threshold: v }),
   });
   const opa = slider({
@@ -211,25 +289,30 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
     max: 1,
     step: 0.05,
     value: s.opacity,
-    format: (v) => `${Math.round(v * 100)}%`,
+    unit: '%',
+    // Stored 0..1, edited as a percentage.
+    toDisplay: (v) => v * 100,
+    fromDisplay: (v) => v / 100,
     onInput: (v) => store.set({ opacity: v }),
   });
   const lo = slider({
     label: 'Scale min',
-    min: -150,
-    max: -60,
+    min: -160,
+    max: 0,
     step: 1,
     value: s.minDbm,
-    format: (v) => `${v}`,
+    unit: 'dBm',
+    decimals: 1,
     onInput: (v) => store.set({ minDbm: v }),
   });
   const hi = slider({
     label: 'Scale max',
-    min: -110,
-    max: 0,
+    min: -160,
+    max: 40,
     step: 1,
     value: s.maxDbm,
-    format: (v) => `${v}`,
+    unit: 'dBm',
+    decimals: 1,
     onInput: (v) => store.set({ maxDbm: v }),
   });
   const spacer = el('div');

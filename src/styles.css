@@ -135,9 +135,51 @@ h1 {
 }
 
 .ctrl .val {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
   color: var(--text-primary);
-  font-variant-numeric: tabular-nums;
   font-size: 12px;
+}
+
+.ctrl .unit {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* Reads as text until you interact with it, but is always a real input -- no hidden
+   click-to-edit affordance to discover. */
+.numval {
+  /* Wide enough for the longest readout, "-160.0", without the field resizing. */
+  width: 6.5ch;
+  padding: 1px 3px;
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: text;
+}
+
+.numval:hover {
+  border-color: var(--border);
+  background: var(--page);
+}
+
+.numval:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--page);
+}
+
+/* Firefox/Chrome spinner suppression in case the type ever changes to number. */
+.numval::-webkit-outer-spin-button,
+.numval::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
 }
 
 input[type='range'] {
