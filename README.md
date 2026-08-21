@@ -1,5 +1,7 @@
 # RF Coverage Explorer
 
+**Live: <https://rf-coverage-explorer.vercel.app>**
+
 An interactive browser tool for visualising RF coverage and KPI maps over real terrain and
 land cover. Everything runs client-side: no backend, no API keys, no running costs.
 
@@ -66,6 +68,25 @@ field you submit.
 This is also why there is no UI framework here. The hot path is typed arrays and canvas, not
 DOM, MapLibre is imperative regardless — and React has no way to express that `opacity` is
 free while `freqMHz` costs 80 ms.
+
+## Deployment
+
+Static hosting on Vercel (`vercel.json`); the build is a plain `dist/` folder, so any static
+host works. Nothing runs server-side — there are no serverless functions and no API routes.
+
+Bandwidth is not a consideration: terrain, land cover and basemap tiles are all fetched by
+the browser straight from USGS, MRLC and OpenFreeMap, so the host only ever ships the ~320 kB
+app bundle. That is roughly 300,000 fresh page loads inside a 100 GB free tier.
+
+Two header decisions worth recording:
+
+- Assets are content-hashed by Vite, so `/assets/*` is served `immutable` for a year. Vercel's
+  default of `max-age=0, must-revalidate` would make every repeat visit re-validate a bundle
+  that cannot change. `index.html` stays uncached so new deploys are picked up at once.
+- **COOP/COEP are deliberately absent.** They would enable `SharedArrayBuffer`, but terrain is
+  uploaded to the worker once per AOI rather than per recompute, so sharing instead of copying
+  saves roughly 30 ms per area change — and `require-corp` risks blocking the cross-origin
+  basemap and data endpoints. Revisit only if Pass 3 profiling says otherwise.
 
 ### Bare earth vs surface elevation is enforced, not documented
 
