@@ -1,0 +1,18 @@
+# Cloudflare Pages headers.
+#
+# COOP/COEP (which SharedArrayBuffer requires) are deliberately NOT set yet. They arrive
+# with Pass 3, where multi-site work makes one shared terrain array worth having instead of
+# a 4 MB copy per worker. `require-corp` blocks cross-origin subresources that do not opt
+# in, and the satellite raster basemap is the likely casualty -- so when the time comes,
+# try `credentialless` first and test that layer specifically.
+#
+#   /*
+#     Cross-Origin-Opener-Policy: same-origin
+#     Cross-Origin-Embedder-Policy: credentialless
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
