@@ -13,6 +13,7 @@ import {
 } from './geo/aoi.js';
 import { toUtm } from './geo/utm.js';
 import { EngineClient } from './engine/client.js';
+import { estimateCost, formatCost } from './engine/cost.js';
 import { DEFAULT_K_FACTOR, type SiteGrid, type TerrainGridSpec } from './engine/types.js';
 import { NlcdProvider } from './providers/clutter/nlcd.js';
 import { Usgs3depProvider } from './providers/terrain/usgs3dep.js';
@@ -159,6 +160,31 @@ store.on('data', async (s) => {
 store.on('propagation', async (s) => {
   const aoi = ctx.aoi;
   if (!aoi || !ctx.terrain) return;
+
+  const enabled = s.sites.filter((x) => x.enabled).length;
+  const cost = estimateCost({
+    sideM: aoi.sideM,
+    demResM: aoi.resM,
+    binM: s.binM,
+    siteCount: Math.max(1, enabled),
+  });
+
+  // Refuse before allocating, not after. At 100 km with 10 m bins the radial fan alone is
+  // ~209 M samples; the tab dies during allocation, so there is no opportunity to warn
+  // partway through. Previous grids are left intact so the map keeps showing something
+  // real, and the status line says plainly that the new settings were not applied.
+  if (cost.level === 'block') {
+    const fix = cost.suggestedBinM
+      ? `Raise bin size to ${cost.suggestedBinM} m or shrink the area.`
+      : 'Shrink the area.';
+    // Only claim a previous result exists when one actually does -- on a first placement
+    // there is nothing behind the refusal and saying otherwise would be a lie.
+    const showing = ctx.grids.size > 0 ? ' Showing the previous result.' : '';
+    controls.setStatus(`Not computed — ${cost.reason}. ${fix}${showing}`, 'error');
+    controls.setCost(formatCost(cost, Math.round(aoi.sideM / s.binM)), 'block');
+    return;
+  }
+  controls.setCost(formatCost(cost, Math.round(aoi.sideM / s.binM)), cost.level);
 
   const coverage = makeCoverageGrid(aoi, s.binM);
   ctx.coverage = coverage;

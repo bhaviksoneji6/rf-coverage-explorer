@@ -213,6 +213,25 @@ select {
   margin: 0;
 }
 
+.cost-readout {
+  margin-top: 2px;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* Status colours are reserved and carry a text explanation in the status line, so the
+   colour is never the only signal that a configuration was refused. */
+.cost-readout.warn {
+  color: #b07400;
+}
+
+.cost-readout.block {
+  color: #d03b3b;
+  font-weight: 600;
+}
+
 #status {
   margin-top: 14px;
   padding-top: 12px;

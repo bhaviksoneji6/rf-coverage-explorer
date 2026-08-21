@@ -163,6 +163,7 @@ function select<T extends string>(
 export interface ControlsHandle {
   syncSite(site: Site | null): void;
   setStatus(text: string, kind?: 'info' | 'busy' | 'error'): void;
+  setCost(text: string, level: 'ok' | 'warn' | 'block'): void;
 }
 
 export function buildControls(root: HTMLElement, store: Store<AppState>): ControlsHandle {
@@ -250,7 +251,10 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
     unit: 'm',
     onInput: (v) => store.set({ binM: v }),
   });
-  areaGroup.append(side.root, bin.root);
+  // The expensive combination is not reachable from either slider alone, so show the
+  // product rather than expecting anyone to multiply it in their head.
+  const cost = el('div', 'cost-readout', '—');
+  areaGroup.append(side.root, bin.root, cost);
   root.append(areaGroup);
 
   // --- Display (Class 0: pure re-colour) ---
@@ -365,6 +369,10 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
     setStatus(text: string, kind: 'info' | 'busy' | 'error' = 'info'): void {
       status.textContent = text;
       status.className = kind === 'info' ? '' : kind;
+    },
+    setCost(text: string, level: 'ok' | 'warn' | 'block'): void {
+      cost.textContent = text;
+      cost.className = `cost-readout ${level}`;
     },
   };
 }

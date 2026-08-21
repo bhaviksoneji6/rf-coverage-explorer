@@ -84,6 +84,28 @@ site moving anywhere inside it costs no network access at all. Only a site pushe
 the edge margin reloads the area. EIRP is deliberately absent from the site signature —
 it belongs to the link budget, so changing it never re-walks a radial.
 
+### The cost guard
+
+The expensive configuration is not reachable from either slider alone — 10 m bins over 2 km
+is instant, 200 m bins over 100 km is instant, but 10 m bins over 100 km is 100 M bins and
+209 M radial samples, about 3.1 GB. So the guard looks at the product, and it **refuses
+before allocating** rather than warning: at that size the tab dies during allocation and a
+warning would never paint.
+
+| AOI | bin | | estimate |
+|---|---|---|---|
+| 30 km | 100 m | ok | 1.9 M samples, ~48 ms, 16 MB |
+| 30 km | 50 m | ok | 3.8 M samples, ~115 ms, 34 MB |
+| 100 km | 200 m | ok | 10.5 M samples, ~237 ms, 84 MB |
+| 100 km | 50 m | warn | 41.9 M samples, ~1.3 s, 381 MB |
+| 100 km | 10 m | **block** | 209 M samples, ~15.2 s, 3.1 GB → suggests 40 m |
+
+A blocked pass keeps the previous grids so the map still shows something real, and the
+status line names the offending numbers and a bin size that would clear it. The panel also
+carries a live readout, because nobody should be expected to multiply two sliders in their
+head. A separate warning fires when bins are finer than the DEM — that is not a cost
+problem, but it means the extra bins are buying smoothing rather than detail.
+
 ## Deployment
 
 Static hosting on Vercel (`vercel.json`); the build is a plain `dist/` folder, so any static

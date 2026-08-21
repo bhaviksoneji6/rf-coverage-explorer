@@ -117,9 +117,13 @@ export interface RadialParams {
  * `stepM` defaults to 15m rather than the 30m DEM spacing because the first Fresnel
  * radius at mid-path is only ~21m at 3.7GHz; 30m steps can walk straight over a ridge.
  */
-export function radialParams(aoi: Aoi, binM: number, stepM = 15): RadialParams {
-  const maxRangeM = (aoi.sideM / 2) * Math.SQRT2;
+export function radialParamsFor(sideM: number, binM: number, stepM = 15): RadialParams {
+  const maxRangeM = (sideM / 2) * Math.SQRT2;
   const needed = Math.ceil((2 * Math.PI * maxRangeM) / binM);
   const nRadials = Math.ceil(needed / 8) * 8;
   return { nRadials, nSteps: Math.ceil(maxRangeM / stepM), stepM, maxRangeM };
+}
+
+export function radialParams(aoi: Aoi, binM: number, stepM = 15): RadialParams {
+  return radialParamsFor(aoi.sideM, binM, stepM);
 }
