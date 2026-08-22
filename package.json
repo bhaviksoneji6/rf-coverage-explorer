@@ -1,6 +1,6 @@
 {
   "name": "rf-coverage-explorer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Interactive browser tool for visualising RF coverage and KPI maps over real terrain and land cover.",
   "author": "Bhavik Soneji <bhaviksoneji6@gmail.com>",
@@ -16,7 +16,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "verify:live": "vite-node scripts/verify-live.ts"
+    "verify:live": "vite-node scripts/verify-live.ts",
+    "icons": "vite-node scripts/make-icons.ts"
   },
   "dependencies": {
     "geotiff": "^2.1.3",

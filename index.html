@@ -2,12 +2,30 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>RF Coverage Explorer</title>
     <meta
       name="description"
       content="Interactive RF coverage and KPI maps over USGS 3DEP terrain and NLCD land cover."
     />
+
+    <link rel="icon" type="image/png" sizes="64x64" href="./favicon-64.png" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#0d366b" />
+
+    <!--
+      iOS "Add to Home Screen". Safari still keys off apple-touch-icon rather than the
+      manifest icons, and applies its own corner rounding, so this one is drawn full-bleed.
+      apple-mobile-web-app-title is what appears under the icon -- without it iOS uses the
+      full <title>, which truncates.
+    -->
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-title" content="RF Coverage" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <!-- "black" keeps content below the status bar; "black-translucent" would slide the
+         control panel underneath it. -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
   </head>
   <body>
     <div id="app">

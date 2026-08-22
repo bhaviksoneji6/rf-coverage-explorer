@@ -54,7 +54,10 @@ body {
   background: var(--surface-1);
   border-right: 1px solid var(--border);
   overflow-y: auto;
-  padding: 16px;
+  /* Safe-area insets matter once this is launched standalone from an iPhone home screen,
+     where there is no browser chrome between the notch and the panel. */
+  padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom))
+    max(16px, env(safe-area-inset-left));
   font-size: 13px;
 }
 
