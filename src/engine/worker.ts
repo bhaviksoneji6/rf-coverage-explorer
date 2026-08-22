@@ -33,30 +33,27 @@ self.onmessage = (ev: MessageEvent<WorkerRequest>) => {
 
     const n = grid.width * grid.height;
     const pathLoss = new Float32Array(n);
+    const diffraction = new Float32Array(n);
     const elevAngle = new Float32Array(n);
 
-    resampleRadialToGrid(
-      radial.pathLoss,
-      params.nRadials,
-      params.nSteps,
-      params.stepM,
-      params.txE,
-      params.txN,
-      grid,
-      pathLoss,
-    );
-    resampleRadialToGrid(
-      radial.elevAngle,
-      params.nRadials,
-      params.nSteps,
-      params.stepM,
-      params.txE,
-      params.txN,
-      grid,
-      elevAngle,
-      NaN,
-      true,
-    );
+    const resample = (src: Float32Array, dst: Float32Array, angular = false): void => {
+      resampleRadialToGrid(
+        src,
+        params.nRadials,
+        params.nSteps,
+        params.stepM,
+        params.txE,
+        params.txN,
+        grid,
+        dst,
+        NaN,
+        angular,
+      );
+    };
+
+    resample(radial.pathLoss, pathLoss);
+    resample(radial.diffraction, diffraction);
+    resample(radial.elevAngle, elevAngle, true);
 
     post(
       {
@@ -64,12 +61,17 @@ self.onmessage = (ev: MessageEvent<WorkerRequest>) => {
         reqId: msg.reqId,
         siteId: msg.siteId,
         pathLoss: pathLoss.buffer as ArrayBuffer,
+        diffraction: diffraction.buffer as ArrayBuffer,
         elevAngle: elevAngle.buffer as ArrayBuffer,
         width: grid.width,
         height: grid.height,
         ms: performance.now() - t0,
       },
-      [pathLoss.buffer as ArrayBuffer, elevAngle.buffer as ArrayBuffer],
+      [
+        pathLoss.buffer as ArrayBuffer,
+        diffraction.buffer as ArrayBuffer,
+        elevAngle.buffer as ArrayBuffer,
+      ],
     );
   } catch (err) {
     post({ type: 'error', reqId: msg.reqId, message: err instanceof Error ? err.message : String(err) });

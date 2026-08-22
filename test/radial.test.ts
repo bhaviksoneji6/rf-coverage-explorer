@@ -2,13 +2,17 @@ import { describe, expect, it } from 'vitest';
 import { makeAoi, makeCoverageGrid, radialParams } from '../src/geo/aoi.js';
 import { computeRadials } from '../src/engine/radial.js';
 import { resampleRadialToGrid } from '../src/engine/resample.js';
-import { DEFAULT_K_FACTOR, type TerrainGridSpec } from '../src/engine/types.js';
+import {
+  DEFAULT_K_FACTOR,
+  type PropagationModel,
+  type TerrainGridSpec,
+} from '../src/engine/types.js';
 import { fsplDb } from '../src/models/fspl.js';
 
 const CENTER = { lon: -122.33, lat: 47.61 };
 const FREQ = 3700;
 
-function setup(sideM = 30000, binM = 100, elevation = 100) {
+function setup(sideM = 30000, binM = 100, elevation = 100, model: PropagationModel = 'fspl') {
   const aoi = makeAoi(CENTER, sideM);
   const coverage = makeCoverageGrid(aoi, binM);
   const rp = radialParams(aoi, coverage.binM);
@@ -28,6 +32,7 @@ function setup(sideM = 30000, binM = 100, elevation = 100) {
     txHeightAglM: 30,
     rxHeightAglM: 1.5,
     freqMHz: FREQ,
+    model,
     nRadials: rp.nRadials,
     nSteps: rp.nSteps,
     stepM: rp.stepM,
@@ -177,5 +182,160 @@ describe('elevation angle', () => {
     const last = radial.elevAngle[params.nSteps - 1] as number;
     const withoutCurvature = Math.atan2(1.5 - 30, d);
     expect(last).toBeLessThan(withoutCurvature);
+  });
+});
+
+describe('terrain horizon and diffraction', () => {
+  it('finds no obstruction over flat ground inside the AOI', () => {
+    // Flat terrain with earth flattening is a downward parabola whose maximum slope from
+    // the TX occurs at sqrt(30 * 2kRe) ~ 22.6 km -- beyond the 21.2 km corner of a 30 km
+    // AOI. So every sample keeps setting a new horizon and nothing is ever shadowed.
+    const { radial } = setup(30000, 100, 100, 'diffraction');
+    let worst = 0;
+    for (const v of radial.diffraction) worst = Math.max(worst, v);
+    expect(worst).toBe(0);
+  });
+
+  it('leaves free-space loss untouched when nothing obstructs', () => {
+    const flat = setup(30000, 100, 100, 'fspl');
+    const dif = setup(30000, 100, 100, 'diffraction');
+    for (let i = 0; i < flat.radial.pathLoss.length; i += 997) {
+      expect(dif.radial.pathLoss[i] as number).toBeCloseTo(flat.radial.pathLoss[i] as number, 6);
+    }
+  });
+
+  it('shadows the far side of a ridge but not the flanks', () => {
+    const aoi = makeAoi(CENTER, 30000);
+    const spec: TerrainGridSpec = {
+      width: aoi.size.width,
+      height: aoi.size.height,
+      minE: aoi.bbox.minE,
+      maxN: aoi.bbox.maxN,
+      resM: aoi.resM,
+    };
+
+    // A 300 m north-south wall 3 km east of the transmitter.
+    const terrain = new Float32Array(aoi.size.width * aoi.size.height).fill(0);
+    const wallCol = Math.round((aoi.center.e + 3000 - aoi.bbox.minE) / aoi.resM);
+    for (let r = 0; r < aoi.size.height; r++) {
+      for (let c = wallCol - 1; c <= wallCol + 1; c++) {
+        terrain[r * aoi.size.width + c] = 300;
+      }
+    }
+
+    const rp = radialParams(aoi, 100);
+    const params = {
+      txE: aoi.center.e,
+      txN: aoi.center.n,
+      txHeightAglM: 30,
+      rxHeightAglM: 1.5,
+      freqMHz: FREQ,
+      model: 'diffraction' as const,
+      nRadials: rp.nRadials,
+      nSteps: rp.nSteps,
+      stepM: rp.stepM,
+      kFactor: DEFAULT_K_FACTOR,
+    };
+    const radial = computeRadials(terrain, spec, params);
+
+    const sampleAt = (bearingDeg: number, rangeM: number): number => {
+      const k = Math.round((bearingDeg / 360) * rp.nRadials) % rp.nRadials;
+      const s = Math.min(rp.nSteps - 1, Math.round(rangeM / rp.stepM) - 1);
+      return radial.diffraction[k * rp.nSteps + s] as number;
+    };
+
+    // Due east at 10 km is squarely behind the wall.
+    expect(sampleAt(90, 10000)).toBeGreaterThan(10);
+    // Due west, north and south are clear of it entirely.
+    expect(sampleAt(270, 10000)).toBe(0);
+    expect(sampleAt(0, 10000)).toBe(0);
+    expect(sampleAt(180, 10000)).toBe(0);
+    // In front of the wall is still clear.
+    expect(sampleAt(90, 2000)).toBe(0);
+  });
+
+  it('is deepest just behind the obstacle and asymptotes further out', () => {
+    const aoi = makeAoi(CENTER, 30000);
+    const spec: TerrainGridSpec = {
+      width: aoi.size.width,
+      height: aoi.size.height,
+      minE: aoi.bbox.minE,
+      maxN: aoi.bbox.maxN,
+      resM: aoi.resM,
+    };
+    const terrain = new Float32Array(aoi.size.width * aoi.size.height).fill(0);
+    const wallCol = Math.round((aoi.center.e + 2000 - aoi.bbox.minE) / aoi.resM);
+    for (let r = 0; r < aoi.size.height; r++) {
+      for (let c = wallCol - 1; c <= wallCol + 1; c++) {
+        terrain[r * aoi.size.width + c] = 200;
+      }
+    }
+    const rp = radialParams(aoi, 100);
+    const radial = computeRadials(terrain, spec, {
+      txE: aoi.center.e,
+      txN: aoi.center.n,
+      txHeightAglM: 30,
+      rxHeightAglM: 1.5,
+      freqMHz: FREQ,
+      model: 'diffraction',
+      nRadials: rp.nRadials,
+      nSteps: rp.nSteps,
+      stepM: rp.stepM,
+      kFactor: DEFAULT_K_FACTOR,
+    });
+    const k = Math.round((90 / 360) * rp.nRadials) % rp.nRadials;
+    const at = (rangeM: number) =>
+      radial.diffraction[k * rp.nSteps + (Math.round(rangeM / rp.stepM) - 1)] as number;
+
+    // Counter-intuitive but correct, and worth pinning precisely because it surprises:
+    // v = h*sqrt(2(d1+d2)/(lambda*d1*d2)) = h*sqrt(2/(lambda*d1)) * sqrt(1 + d1/d2), which
+    // falls monotonically as d2 grows. The diffraction angle is largest immediately behind
+    // the edge, so the shadow is deepest there and eases to a floor further out. It never
+    // recovers to zero, which is what makes the geometric shadow visible at all ranges.
+    expect(at(2200)).toBeGreaterThan(at(6000));
+    expect(at(6000)).toBeGreaterThan(at(12000));
+    expect(at(12000)).toBeGreaterThan(at(20000));
+
+    // The floor is still a deep shadow, not a rounding artefact.
+    expect(at(20000)).toBeGreaterThan(20);
+  });
+
+  it('deepens the shadow for a taller obstacle and at higher frequency', () => {
+    const aoi = makeAoi(CENTER, 30000);
+    const spec: TerrainGridSpec = {
+      width: aoi.size.width,
+      height: aoi.size.height,
+      minE: aoi.bbox.minE,
+      maxN: aoi.bbox.maxN,
+      resM: aoi.resM,
+    };
+    const rp = radialParams(aoi, 100);
+
+    const shadowAt = (wallHeightM: number, freqMHz: number): number => {
+      const terrain = new Float32Array(aoi.size.width * aoi.size.height).fill(0);
+      const wallCol = Math.round((aoi.center.e + 2000 - aoi.bbox.minE) / aoi.resM);
+      for (let r = 0; r < aoi.size.height; r++) {
+        for (let c = wallCol - 1; c <= wallCol + 1; c++) {
+          terrain[r * aoi.size.width + c] = wallHeightM;
+        }
+      }
+      const radial = computeRadials(terrain, spec, {
+        txE: aoi.center.e,
+        txN: aoi.center.n,
+        txHeightAglM: 30,
+        rxHeightAglM: 1.5,
+        freqMHz,
+        model: 'diffraction',
+        nRadials: rp.nRadials,
+        nSteps: rp.nSteps,
+        stepM: rp.stepM,
+        kFactor: DEFAULT_K_FACTOR,
+      });
+      const k = Math.round((90 / 360) * rp.nRadials) % rp.nRadials;
+      return radial.diffraction[k * rp.nSteps + (Math.round(8000 / rp.stepM) - 1)] as number;
+    };
+
+    expect(shadowAt(300, 3700)).toBeGreaterThan(shadowAt(150, 3700));
+    expect(shadowAt(200, 3700)).toBeGreaterThan(shadowAt(200, 700));
   });
 });

@@ -73,11 +73,12 @@ function rawCost(input: CostInput): { bins: number; radialSamples: number; bytes
   const radialSamples = rp.nRadials * rp.nSteps;
 
   const bytes =
-    // pathLoss + elevAngle over the radial fan, held transiently in the worker
-    2 * 4 * radialSamples +
-    // pathLoss + elevAngle per site on the output grid, held for the session
-    2 * 4 * bins * siteCount +
-    // the derived KPI grid plus its RGBA rendering
+    // pathLoss + diffraction + elevAngle over the radial fan, transient in the worker
+    3 * 4 * radialSamples +
+    // the same three per site on the output grid, held for the session
+    3 * 4 * bins * siteCount +
+    // clutter class per bin, plus the derived KPI grid and its RGBA rendering
+    1 * bins +
     4 * bins +
     4 * bins;
 

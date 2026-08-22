@@ -15,6 +15,7 @@ export type WorkerResponse =
       reqId: number;
       siteId: string;
       pathLoss: ArrayBuffer;
+      diffraction: ArrayBuffer;
       elevAngle: ArrayBuffer;
       width: number;
       height: number;

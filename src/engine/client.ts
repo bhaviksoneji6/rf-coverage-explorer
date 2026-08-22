@@ -59,6 +59,7 @@ export class EngineClient {
     resolve({
       siteId: msg.siteId,
       pathLoss: new Float32Array(msg.pathLoss),
+      diffraction: new Float32Array(msg.diffraction),
       elevAngle: new Float32Array(msg.elevAngle),
       width: msg.width,
       height: msg.height,

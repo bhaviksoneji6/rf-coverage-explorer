@@ -1,3 +1,5 @@
+import type { PropagationModel } from '../engine/types.js';
+import { CLUTTER_COLORS, CLUTTER_NAMES } from '../providers/types.js';
 import { RAMP_LABELS, type RampName } from '../render/colormap.js';
 import type { Stage, Store } from '../store/store.js';
 import type { AppState, KpiName, Site } from '../store/types.js';
@@ -225,6 +227,54 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
   txGroup.append(freq.root, txh.root, eirp.root, rxh.root);
   root.append(txGroup);
 
+  // --- Propagation model (Class 2) ---
+  const modelGroup = group('Propagation', 'recompute');
+  modelGroup.append(
+    select<PropagationModel>(
+      [
+        { value: 'fspl', label: 'Free space (no terrain)' },
+        { value: 'diffraction', label: 'Terrain + knife-edge diffraction' },
+      ],
+      s.model,
+      (v) => store.set({ model: v }),
+    ),
+  );
+
+  // Clutter is a per-bin loss applied in the link budget, so the whole table is Class 1 --
+  // dragging a value recolours the map without re-walking a single radial.
+  const clutterHead = el('div');
+  clutterHead.style.marginTop = '10px';
+  clutterHead.append(
+    toggle('Apply clutter loss', s.applyClutter, (v) => store.set({ applyClutter: v })),
+  );
+  modelGroup.append(clutterHead);
+
+  const table = el('div', 'clutter-table');
+  for (const cls of [1, 2, 3, 4, 5, 6, 7]) {
+    const rgb = CLUTTER_COLORS[cls] ?? [0, 0, 0];
+    const sw = el('span', 'legend-swatch');
+    sw.style.background = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+    const name = el('span', 'name', CLUTTER_NAMES[cls] ?? String(cls));
+    const input = el('input');
+    input.type = 'text';
+    input.inputMode = 'decimal';
+    input.value = String(s.clutterLossDb[cls] ?? 0);
+    input.setAttribute('aria-label', `${CLUTTER_NAMES[cls]} clutter loss in dB`);
+    input.addEventListener('change', () => {
+      const v = parseFieldValue(input.value, { min: 0, max: 60 });
+      const current = store.get().clutterLossDb;
+      if (v === null) {
+        input.value = String(current[cls] ?? 0);
+        return;
+      }
+      input.value = String(v);
+      store.set({ clutterLossDb: { ...current, [cls]: v } });
+    });
+    table.append(sw, name, input);
+  }
+  modelGroup.append(table);
+  root.append(modelGroup);
+
   // --- Area (Class 3: refetches) ---
   const areaGroup = group('Area', 'refetch');
   const side = slider({
@@ -263,7 +313,9 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
     select<KpiName>(
       [
         { value: 'rsl', label: 'Received level (dBm)' },
-        { value: 'pathLoss', label: 'Path loss (dB)' },
+        { value: 'pathLoss', label: 'Total path loss (dB)' },
+        { value: 'diffraction', label: 'Diffraction loss (dB)' },
+        { value: 'clutter', label: 'Clutter loss (dB)' },
       ],
       s.kpi,
       (v) => store.set({ kpi: v }),

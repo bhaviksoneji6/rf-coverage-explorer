@@ -27,12 +27,20 @@ export const EARTH_RADIUS_M = 6371008.8;
  */
 export const DEFAULT_K_FACTOR = 4 / 3;
 
+/**
+ * Model 0 is free space only; model 1 adds a terrain horizon and single knife-edge
+ * diffraction. Clutter is not listed here because it is a per-bin loss applied in the link
+ * budget, not something the radial walk knows about.
+ */
+export type PropagationModel = 'fspl' | 'diffraction';
+
 export interface ComputeParams {
   txE: number;
   txN: number;
   txHeightAglM: number;
   rxHeightAglM: number;
   freqMHz: number;
+  model: PropagationModel;
   nRadials: number;
   nSteps: number;
   stepM: number;
@@ -40,8 +48,10 @@ export interface ComputeParams {
 }
 
 export interface RadialFields {
-  /** nRadials * nSteps, dB. */
+  /** nRadials * nSteps, dB, free space plus diffraction. */
   pathLoss: Float32Array;
+  /** nRadials * nSteps, dB, the diffraction component alone. */
+  diffraction: Float32Array;
   /** nRadials * nSteps, radians, TX -> RX geometric elevation angle. */
   elevAngle: Float32Array;
 }
@@ -49,6 +59,7 @@ export interface RadialFields {
 /** One site's results on the coverage grid. NaN outside maximum range. */
 export interface SiteGrid {
   pathLoss: Float32Array;
+  diffraction: Float32Array;
   elevAngle: Float32Array;
   width: number;
   height: number;

@@ -9,10 +9,9 @@ The goal is **interaction speed, not prediction accuracy**. There are plenty of 
 model propagation rigorously and slowly; the point of this one is to drag a transmitter,
 retune a frequency, and watch the map change immediately.
 
-> **Status: Pass 1.** The full data pipeline is live end-to-end — fetch, decode, project,
-> radial engine, render — with free-space path loss as the model. Diffraction, clutter loss,
-> multi-site aggregation and antenna patterns are scaffolded but not implemented. See
-> [Roadmap](#roadmap).
+> **Status: Pass 2.** Terrain diffraction, per-bin clutter loss and the hover path-profile
+> panel are live. Multi-site aggregation and antenna patterns are scaffolded but not
+> implemented. See [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -37,6 +36,29 @@ EPSG:4326 grid has pixels 1.47× taller than wide, and Web Mercator's scale fact
 
 Both data endpoints reproject **server-side**, so terrain and land cover arrive already
 pixel-aligned on a true square-metre grid.
+
+### Models
+
+| | What it does |
+|---|---|
+| **Free space** | Distance only. Its map must be perfectly radially symmetric, which is what makes it a usable check on the geometry rather than a toy. |
+| **Terrain + diffraction** | Walks a terrain horizon and applies single knife-edge diffraction (ITU-R P.526 eq. 31) over the controlling obstacle. |
+
+Clutter is deliberately **not** a model: it is a per-bin loss looked up from an editable dB
+table and applied in the link budget, so the whole table is a Class 1 control.
+
+Two things about the diffraction that are worth stating because they surprise people:
+
+- **J(0) = 6.03 dB, not 6.02.** The exact grazing loss is 20log₁₀(2) = 6.0206 dB; P.526
+  eq. 31 is a fitted approximation to the Fresnel integral and sits 12 millidecibels high.
+  The tests pin the formula's own value and separately assert it tracks the theory.
+- **The shadow is deepest immediately behind an obstacle**, easing to a floor further out.
+  v = h·√(2(d₁+d₂)/(λd₁d₂)) = h·√(2/(λd₁))·√(1 + d₁/d₂), which falls monotonically as d₂
+  grows. Over Seattle the floor lands around 39 dB.
+
+Known limitation, and the reason this is Model 1 rather than the destination: a single edge
+under-predicts loss when several obstacles block a path. Delta-Bullington is the fix, and it
+is the same horizon walk feeding it.
 
 ### Radial walk, not per-bin profiles
 
@@ -183,13 +205,14 @@ Beyond `npm run test`, the vertical slice is checked visually:
   roughly 40% water / 51% developed / 7% forest.
 - The FSPL coverage map must be **perfectly radially symmetric**. It ignores terrain, so any
   asymmetry is a bug in the radial walk or the resample.
+- Switch to **Terrain + diffraction** and the symmetry must break, with shadows falling on the
+  far side of ridges. Select the **Diffraction loss** layer to see the shadowing alone.
+- Hover anywhere on the map for the path profile: terrain silhouette, the direct ray, the
+  first Fresnel ellipse, the controlling knife edge, and the land-cover band.
 - Reload — terrain and land cover come from IndexedDB with no refetch.
 
 ## Roadmap
 
-- **Pass 2** — single knife-edge diffraction (ITU-R P.526) off the radial horizon, per-bin
-  clutter loss from an editable dB table, and a hover terrain-profile panel showing the ray,
-  the Fresnel ellipse, the controlling knife edge and the clutter class.
 - **Pass 3** — multi-site: site list, per-site frequency, best-server / SINR / overlap-count
   aggregation, SharedArrayBuffer and a worker pool.
 - **Pass 4** — ITU-R F.1336 antenna patterns (applied in the link-budget stage, so downtilt

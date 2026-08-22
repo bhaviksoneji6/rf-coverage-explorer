@@ -1,3 +1,4 @@
+import type { PropagationModel } from '../engine/types.js';
 import type { RampName } from '../render/colormap.js';
 import type { Stage } from './store.js';
 
@@ -12,7 +13,28 @@ export interface Site {
   txHeightM: number;
 }
 
-export type KpiName = 'rsl' | 'pathLoss';
+/** Loss layers use their own 0..N dB scale rather than the received-level range. */
+export const LOSS_SCALE_MAX_DB = 40;
+
+export type KpiName = 'rsl' | 'pathLoss' | 'diffraction' | 'clutter';
+
+/**
+ * Default clutter loss per normalised class, dB, at roughly 1-2 GHz.
+ *
+ * Empirical starting values, deliberately editable in the UI rather than baked in. The
+ * honest limitation is that they carry no frequency dependence -- real clutter loss rises
+ * with frequency -- which is what ITU-R P.2108 would fix later.
+ */
+export const DEFAULT_CLUTTER_LOSS_DB: Record<number, number> = {
+  0: 0, // no data
+  1: 0, // water
+  2: 1, // open / rural
+  3: 6, // suburban
+  4: 12, // urban
+  5: 18, // dense urban
+  6: 11, // forest
+  7: 4, // wetland
+};
 
 export interface AppState {
   /** Multi-site from the start: Pass 1 renders one, but nothing here assumes that. */
@@ -25,6 +47,11 @@ export interface AppState {
   binM: number;
 
   rxHeightM: number;
+  model: PropagationModel;
+
+  /** Applied per receive bin in the link budget, so editing the table is instant. */
+  applyClutter: boolean;
+  clutterLossDb: Record<number, number>;
 
   kpi: KpiName;
   ramp: RampName;
@@ -49,6 +76,9 @@ export const DEFAULT_STATE: AppState = {
   aoiSideM: 30000,
   binM: 50,
   rxHeightM: 1.5,
+  model: 'diffraction',
+  applyClutter: true,
+  clutterLossDb: { ...DEFAULT_CLUTTER_LOSS_DB },
   kpi: 'rsl',
   ramp: 'signal',
   minDbm: -120,
@@ -76,6 +106,12 @@ export const STAGE_FOR: Partial<Record<keyof AppState, Stage>> = {
   sites: 'propagation',
   binM: 'propagation',
   rxHeightM: 'propagation',
+  model: 'propagation',
+
+  // Class 1: clutter is a per-bin loss, so the table recombines cached path loss and never
+  // re-walks a radial. That is what makes dragging a clutter value feel instant.
+  applyClutter: 'linkBudget',
+  clutterLossDb: 'linkBudget',
 
   // Class 1: recombines cached path loss into a received level.
   selectedSiteId: 'linkBudget',

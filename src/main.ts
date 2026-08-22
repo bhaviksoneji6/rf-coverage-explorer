@@ -14,6 +14,8 @@ import {
 import { toUtm } from './geo/utm.js';
 import { EngineClient } from './engine/client.js';
 import { estimateCost, formatCost } from './engine/cost.js';
+import { computeProfile } from './engine/profile.js';
+import { sampleNearest } from './engine/sampler.js';
 import { DEFAULT_K_FACTOR, type SiteGrid, type TerrainGridSpec } from './engine/types.js';
 import { NlcdProvider } from './providers/clutter/nlcd.js';
 import { Usgs3depProvider } from './providers/terrain/usgs3dep.js';
@@ -22,9 +24,10 @@ import { rasterize } from './render/colormap.js';
 import { clutterToRgba, hillshadeToRgba } from './render/hillshade.js';
 import { aoiCorners, RasterOverlay, type Corners } from './render/rasterLayer.js';
 import { createStore } from './store/store.js';
-import { DEFAULT_STATE, STAGE_FOR, type AppState, type Site } from './store/types.js';
+import { DEFAULT_STATE, LOSS_SCALE_MAX_DB, STAGE_FOR, type AppState, type Site } from './store/types.js';
 import { buildControls } from './ui/controls.js';
 import { renderLegend } from './ui/legend.js';
+import { createProfileChart } from './ui/profile.js';
 
 const BASEMAP = 'https://tiles.openfreemap.org/styles/positron';
 const START = { lon: -122.33, lat: 47.61, zoom: 10.2 };
@@ -48,6 +51,8 @@ interface Ctx {
   grids: Map<string, SiteGrid>;
   /** Per-site hash of every propagation input, so unchanged sites are not recomputed. */
   signatures: Map<string, string>;
+  /** Clutter class per coverage bin, resampled from the AOI raster once per grid change. */
+  binClutter: Uint8Array | null;
   kpiValues: Float32Array | null;
   rgba: Uint8ClampedArray<ArrayBuffer> | null;
   demRgba: Uint8ClampedArray<ArrayBuffer> | null;
@@ -63,6 +68,7 @@ const ctx: Ctx = {
   coverage: null,
   grids: new Map(),
   signatures: new Map(),
+  binClutter: null,
   kpiValues: null,
   rgba: null,
   demRgba: null,
@@ -106,6 +112,24 @@ function demSpec(aoi: Aoi): TerrainGridSpec {
 
 function ensureBuffer(current: Uint8ClampedArray<ArrayBuffer> | null, n: number): Uint8ClampedArray<ArrayBuffer> {
   return current && current.length === n * 4 ? current : new Uint8ClampedArray(n * 4);
+}
+
+/** Clutter classes from the AOI raster onto the (usually coarser) coverage grid. */
+function resampleClutterToBins(
+  clutter: Uint8Array,
+  spec: TerrainGridSpec,
+  coverage: CoverageGrid,
+): Uint8Array {
+  const { width, height } = coverage.size;
+  const out = new Uint8Array(width * height);
+  for (let j = 0; j < height; j++) {
+    const n = coverage.bbox.maxN - (j + 0.5) * coverage.binM;
+    for (let i = 0; i < width; i++) {
+      const e = coverage.bbox.minE + (i + 0.5) * coverage.binM;
+      out[j * width + i] = sampleNearest(clutter, spec, e, n);
+    }
+  }
+  return out;
 }
 
 // --- Stage: data (Class 3, network) -----------------------------------------------------
@@ -190,6 +214,12 @@ store.on('propagation', async (s) => {
   ctx.coverage = coverage;
   const rp = radialParams(aoi, coverage.binM);
 
+  // Clutter classes onto the coverage grid, nearest-neighbour because class codes must never
+  // be blended. Done once per grid change so the link-budget stage is a pure table lookup.
+  ctx.binClutter = ctx.clutter
+    ? resampleClutterToBins(ctx.clutter, demSpec(aoi), coverage)
+    : null;
+
   // Forget sites that no longer exist, but keep the rest -- recomputing every site whenever
   // any one of them changes is exactly the waste this stage exists to avoid. With eight
   // sites, nudging one frequency would otherwise pay for eight radial walks.
@@ -218,6 +248,7 @@ store.on('propagation', async (s) => {
       site.lat,
       site.txHeightM,
       site.freqMHz,
+      s.model,
     ].join('|');
 
     if (ctx.signatures.get(site.id) === signature && ctx.grids.has(site.id)) {
@@ -234,6 +265,7 @@ store.on('propagation', async (s) => {
         txHeightAglM: site.txHeightM,
         rxHeightAglM: s.rxHeightM,
         freqMHz: site.freqMHz,
+        model: s.model,
         nRadials: rp.nRadials,
         nSteps: rp.nSteps,
         stepM: rp.stepM,
@@ -276,16 +308,43 @@ store.on('linkBudget', (s) => {
   }
 
   const n = grid.pathLoss.length;
-  if (s.kpi === 'pathLoss') {
-    ctx.kpiValues = grid.pathLoss;
+  const binClutter = ctx.binClutter;
+
+  // Clutter loss per receive bin. Applying it here rather than in the radial walk is what
+  // makes the whole loss table a Class 1 control: editing a value recombines cached path
+  // loss and never re-walks a radial.
+  const clutterAt = (i: number): number => {
+    if (!s.applyClutter || !binClutter) return 0;
+    return s.clutterLossDb[binClutter[i] as number] ?? 0;
+  };
+
+  const out = new Float32Array(n);
+
+  if (s.kpi === 'diffraction') {
+    ctx.kpiValues = grid.diffraction;
     return;
   }
 
-  // Pass 1 link budget: isotropic, no antenna pattern, no RX gain, no feeder loss.
-  // Antenna gain enters here (not in propagation) because grid.elevAngle is already
-  // cached -- which is what will make downtilt an instant control in Pass 4.
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) out[i] = site.eirpDbm - (grid.pathLoss[i] as number);
+  if (s.kpi === 'clutter') {
+    for (let i = 0; i < n; i++) {
+      out[i] = Number.isFinite(grid.pathLoss[i] as number) ? clutterAt(i) : NaN;
+    }
+    ctx.kpiValues = out;
+    return;
+  }
+
+  if (s.kpi === 'pathLoss') {
+    for (let i = 0; i < n; i++) out[i] = (grid.pathLoss[i] as number) + clutterAt(i);
+    ctx.kpiValues = out;
+    return;
+  }
+
+  // Received level. Isotropic for now: no antenna pattern, RX gain or feeder loss.
+  // Antenna gain will enter here rather than in propagation, because grid.elevAngle is
+  // already cached -- which is what will make downtilt an instant control in Pass 4.
+  for (let i = 0; i < n; i++) {
+    out[i] = site.eirpDbm - (grid.pathLoss[i] as number) - clutterAt(i);
+  }
   ctx.kpiValues = out;
 });
 
@@ -301,14 +360,17 @@ store.on('render', (s) => {
   if (s.showCoverage && ctx.kpiValues && coverage) {
     const n = coverage.size.width * coverage.size.height;
     ctx.rgba = ensureBuffer(ctx.rgba, n);
-    const isLoss = s.kpi === 'pathLoss';
+    // Three different scales: received level uses the dBm range directly; total path loss
+    // reuses it inverted so dark still means "better"; the diagnostic loss layers get their
+    // own fixed 0..40 dB scale, where dark means "more loss here".
+    const isLossLayer = s.kpi === 'diffraction' || s.kpi === 'clutter';
+    const isPathLoss = s.kpi === 'pathLoss';
     rasterize(ctx.kpiValues, ctx.rgba, {
-      // Path loss reads "more is worse", so invert the domain to keep dark = better signal.
-      min: isLoss ? -s.maxDbm : s.minDbm,
-      max: isLoss ? -s.minDbm : s.maxDbm,
+      min: isLossLayer ? 0 : isPathLoss ? -s.maxDbm : s.minDbm,
+      max: isLossLayer ? LOSS_SCALE_MAX_DB : isPathLoss ? -s.minDbm : s.maxDbm,
       ramp: s.ramp,
       opacity: s.opacity,
-      ...(isLoss ? {} : { threshold: s.threshold }),
+      ...(isLossLayer || isPathLoss ? {} : { threshold: s.threshold }),
     });
     coverageLayer ??= new RasterOverlay(map, 'coverage', { resampling: 'linear' });
     coverageLayer.update(ctx.rgba, coverage.size.width, coverage.size.height, corners);
@@ -343,6 +405,8 @@ store.on('render', (s) => {
 
   renderLegend(legendEl, s);
   controls.syncSite(selectedSite(s));
+  // Keep the profile consistent with whatever the map is now showing.
+  scheduleProfile();
 });
 
 // --- Interaction ------------------------------------------------------------------------
@@ -397,6 +461,77 @@ function addMarker(site: Site): void {
 }
 
 map.on('click', (ev) => placeOrMoveSite(ev.lngLat.lng, ev.lngLat.lat));
+
+// --- Hover path profile ------------------------------------------------------------------
+
+const profileEl = document.getElementById('profile') as HTMLElement;
+const profileChart = createProfileChart(
+  document.getElementById('profile-canvas') as HTMLCanvasElement,
+  document.getElementById('profile-readout') as HTMLElement,
+);
+
+let hoverLonLat: { lon: number; lat: number } | null = null;
+let profileQueued = false;
+
+/**
+ * Recompute and redraw the cursor profile.
+ *
+ * Throttled to one animation frame: mousemove fires far faster than the screen updates, and
+ * a profile is ~1400 samples plus a canvas repaint. Doing it per event would burn frames
+ * for output nobody sees.
+ */
+function scheduleProfile(): void {
+  if (profileQueued) return;
+  profileQueued = true;
+  requestAnimationFrame(() => {
+    profileQueued = false;
+    drawProfile();
+  });
+}
+
+function drawProfile(): void {
+  const s = store.get();
+  const site = selectedSite(s);
+  const aoi = ctx.aoi;
+  if (!site || !aoi || !ctx.terrain || !hoverLonLat) {
+    profileEl.hidden = true;
+    return;
+  }
+
+  const tx = toUtm({ lon: site.lon, lat: site.lat }, aoi.zone);
+  const rx = toUtm(hoverLonLat, aoi.zone);
+
+  const profile = computeProfile(ctx.terrain, demSpec(aoi), ctx.clutter, {
+    txE: tx.e,
+    txN: tx.n,
+    txHeightAglM: site.txHeightM,
+    rxE: rx.e,
+    rxN: rx.n,
+    rxHeightAglM: s.rxHeightM,
+    freqMHz: site.freqMHz,
+    kFactor: DEFAULT_K_FACTOR,
+  });
+
+  // The panel must agree with the map, so it honours the same model and clutter switches.
+  if (s.model === 'fspl') profile.diffractionDb = 0;
+  const rxClass = profile.clutter ? (profile.clutter[profile.clutter.length - 1] as number) : 0;
+  const clutterLossDb = s.applyClutter ? (s.clutterLossDb[rxClass] ?? 0) : 0;
+
+  profileEl.hidden = false;
+  profileChart.draw(profile, {
+    freqMHz: site.freqMHz,
+    eirpDbm: site.eirpDbm,
+    clutterLossDb,
+  });
+}
+
+map.on('mousemove', (ev) => {
+  hoverLonLat = { lon: ev.lngLat.lng, lat: ev.lngLat.lat };
+  scheduleProfile();
+});
+
+// Keep the last profile on screen when the cursor leaves, rather than flashing it away.
+window.addEventListener('resize', scheduleProfile);
 
 map.on('load', () => {
   renderLegend(legendEl, store.get());

@@ -1,6 +1,6 @@
 import { sampleRamp } from '../render/colormap.js';
 import { CLUTTER_COLORS, CLUTTER_NAMES } from '../providers/types.js';
-import type { AppState } from '../store/types.js';
+import { LOSS_SCALE_MAX_DB, type AppState } from '../store/types.js';
 
 const CLUTTER_ORDER = [1, 2, 3, 4, 5, 6, 7];
 
@@ -17,10 +17,17 @@ const CLUTTER_ORDER = [1, 2, 3, 4, 5, 6, 7];
 export function renderLegend(root: HTMLElement, s: AppState): void {
   root.replaceChildren();
 
+  const KPI_TITLES: Record<string, string> = {
+    rsl: 'Received level',
+    pathLoss: 'Total path loss',
+    diffraction: 'Diffraction loss',
+    clutter: 'Clutter loss',
+  };
+
   if (s.showCoverage) {
     const title = document.createElement('div');
     title.className = 'legend-title';
-    title.textContent = s.kpi === 'rsl' ? 'Received level' : 'Path loss';
+    title.textContent = KPI_TITLES[s.kpi] ?? 'Coverage';
     root.append(title);
 
     const stops: string[] = [];
@@ -36,15 +43,20 @@ export function renderLegend(root: HTMLElement, s: AppState): void {
     const ticks = document.createElement('div');
     ticks.className = 'legend-ticks';
     const unit = s.kpi === 'rsl' ? 'dBm' : 'dB';
-    const mid = Math.round((s.minDbm + s.maxDbm) / 2);
-    for (const [i, v] of [s.minDbm, mid, s.maxDbm].entries()) {
+    // Loss layers are drawn on their own fixed scale, not the dBm range, so the legend has
+    // to say so rather than showing received-level numbers against a loss ramp.
+    const isLossLayer = s.kpi === 'diffraction' || s.kpi === 'clutter';
+    const lo = isLossLayer ? 0 : s.minDbm;
+    const hi = isLossLayer ? LOSS_SCALE_MAX_DB : s.maxDbm;
+    const mid = Math.round((lo + hi) / 2);
+    for (const [i, v] of [lo, mid, hi].entries()) {
       const t = document.createElement('span');
       t.textContent = i === 2 ? `${v} ${unit}` : String(v);
       ticks.append(t);
     }
     root.append(ticks);
 
-    if (s.threshold > s.minDbm) {
+    if (!isLossLayer && s.threshold > s.minDbm) {
       const note = document.createElement('div');
       note.style.marginTop = '5px';
       note.textContent = `Hidden below ${s.threshold} dBm`;

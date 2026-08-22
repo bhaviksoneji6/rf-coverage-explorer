@@ -72,20 +72,6 @@ async function main(): Promise<void> {
     maxN: aoi.bbox.maxN,
     resM: aoi.resM,
   };
-  const params = {
-    txE: aoi.center.e,
-    txN: aoi.center.n,
-    txHeightAglM: 30,
-    rxHeightAglM: 1.5,
-    freqMHz: 3700,
-    nRadials: rp.nRadials,
-    nSteps: rp.nSteps,
-    stepM: rp.stepM,
-    kFactor: DEFAULT_K_FACTOR,
-  };
-
-  const t1 = Date.now();
-  const radial = computeRadials(terrain, spec, params);
   const grid = {
     width: coverage.size.width,
     height: coverage.size.height,
@@ -93,42 +79,102 @@ async function main(): Promise<void> {
     maxN: coverage.bbox.maxN,
     binM: coverage.binM,
   };
-  const pathLoss = new Float32Array(grid.width * grid.height);
-  const elev = new Float32Array(grid.width * grid.height);
-  resampleRadialToGrid(radial.pathLoss, rp.nRadials, rp.nSteps, rp.stepM, params.txE, params.txN, grid, pathLoss);
-  resampleRadialToGrid(radial.elevAngle, rp.nRadials, rp.nSteps, rp.stepM, params.txE, params.txN, grid, elev, NaN, true);
-  const engineMs = Date.now() - t1;
+  const W = grid.width;
+
+  function run(model: 'fspl' | 'diffraction') {
+    const params = {
+      txE: aoi.center.e,
+      txN: aoi.center.n,
+      txHeightAglM: 30,
+      rxHeightAglM: 1.5,
+      freqMHz: 3700,
+      model,
+      nRadials: rp.nRadials,
+      nSteps: rp.nSteps,
+      stepM: rp.stepM,
+      kFactor: DEFAULT_K_FACTOR,
+    };
+    const t = Date.now();
+    const radial = computeRadials(terrain, spec, params);
+    const pathLoss = new Float32Array(W * grid.height);
+    const diff = new Float32Array(W * grid.height);
+    const elev = new Float32Array(W * grid.height);
+    const rs = (src: Float32Array, dst: Float32Array, ang = false) =>
+      resampleRadialToGrid(src, rp.nRadials, rp.nSteps, rp.stepM, params.txE, params.txN, grid, dst, NaN, ang);
+    rs(radial.pathLoss, pathLoss);
+    rs(radial.diffraction, diff);
+    rs(radial.elevAngle, elev, true);
+    return { pathLoss, diff, elev, ms: Date.now() - t };
+  }
+
+  const mirrorAsymmetry = (f: Float32Array): number => {
+    let worst = 0;
+    for (let j = 0; j < grid.height; j += 7) {
+      for (let i = 0; i < W; i += 7) {
+        const d = Math.abs((f[j * W + i] as number) - (f[j * W + (W - 1 - i)] as number));
+        if (Number.isFinite(d)) worst = Math.max(worst, d);
+      }
+    }
+    return worst;
+  };
 
   console.log(`        ${rp.nRadials} radials x ${rp.nSteps} steps = ${(rp.nRadials * rp.nSteps / 1e6).toFixed(2)} M samples`);
-  check('engine is interactive', engineMs < 500, `${engineMs} ms for ${grid.width}x${grid.height} bins`);
-  check('no unfilled bins', pathLoss.every(Number.isFinite), '');
 
-  // FSPL ignores terrain, so the loss map must stay perfectly symmetric even over real hills.
-  const W = grid.width;
-  const at = (i: number, j: number) => pathLoss[j * W + i] as number;
-  let worstAsym = 0;
-  for (let j = 0; j < grid.height; j += 7) {
-    for (let i = 0; i < W; i += 7) {
-      worstAsym = Math.max(worstAsym, Math.abs(at(i, j) - at(W - 1 - i, j)));
-    }
-  }
-  check('FSPL stays radially symmetric over real terrain', worstAsym < 0.01, `worst ${worstAsym.toExponential(1)} dB`);
+  const fspl = run('fspl');
+  check('engine is interactive', fspl.ms < 500, `${fspl.ms} ms for ${W}x${grid.height} bins (FSPL)`);
+  check('no unfilled bins', fspl.pathLoss.every(Number.isFinite), '');
 
-  // Elevation angle DOES read terrain, so it must NOT be symmetric -- this is the assertion
-  // that proves the DEM is actually reaching the engine rather than being ignored.
-  const atE = (i: number, j: number) => elev[j * W + i] as number;
-  let maxElevAsym = 0;
-  for (let j = 0; j < grid.height; j += 7) {
-    for (let i = 0; i < W; i += 7) {
-      const d = Math.abs(atE(i, j) - atE(W - 1 - i, j));
-      if (Number.isFinite(d)) maxElevAsym = Math.max(maxElevAsym, d);
-    }
-  }
+  // Free space ignores terrain, so its map must be perfectly symmetric even over real hills.
+  check(
+    'FSPL stays radially symmetric over real terrain',
+    mirrorAsymmetry(fspl.pathLoss) < 0.01,
+    `worst ${mirrorAsymmetry(fspl.pathLoss).toExponential(1)} dB`,
+  );
+
+  // Elevation angle reads terrain, so it must NOT be symmetric. This is what proves the DEM
+  // is actually reaching the engine rather than being quietly ignored.
   check(
     'elevation angle reflects real terrain (asymmetric)',
-    maxElevAsym > 0.01,
-    `max mirror difference ${(maxElevAsym * 1000).toFixed(1)} mrad`,
+    mirrorAsymmetry(fspl.elev) > 0.01,
+    `max mirror difference ${(mirrorAsymmetry(fspl.elev) * 1000).toFixed(1)} mrad`,
   );
+
+  console.log('\nDiffraction (Model 1 over real terrain):');
+  const dif = run('diffraction');
+  check('still interactive with diffraction', dif.ms < 800, `${dif.ms} ms`);
+  check('no unfilled bins', dif.pathLoss.every(Number.isFinite), '');
+
+  let shadowed = 0;
+  let worstDb = 0;
+  let diffSum = 0;
+  for (const v of dif.diff) {
+    if (v > 0.1) shadowed++;
+    if (v > worstDb) worstDb = v;
+    if (Number.isFinite(v)) diffSum += v;
+  }
+  const shadowFrac = shadowed / dif.diff.length;
+
+  check('diffraction is never negative (it is a loss)', Array.from(dif.diff).every((v) => !(v < 0)), '');
+  check(
+    'real terrain casts real shadows',
+    shadowFrac > 0.02 && shadowFrac < 0.9,
+    `${(shadowFrac * 100).toFixed(1)}% of bins obstructed`,
+  );
+  check('shadow depth is physically plausible', worstDb > 5 && worstDb < 60, `worst ${worstDb.toFixed(1)} dB`);
+  check(
+    'diffraction breaks the symmetry FSPL had',
+    mirrorAsymmetry(dif.pathLoss) > 1,
+    `worst mirror difference ${mirrorAsymmetry(dif.pathLoss).toFixed(1)} dB`,
+  );
+  check(
+    'total loss equals free space plus diffraction',
+    Array.from(dif.pathLoss).every((v, i) => {
+      const expect = (fspl.pathLoss[i] as number) + (dif.diff[i] as number);
+      return !Number.isFinite(v) || Math.abs(v - expect) < 0.02;
+    }),
+    '',
+  );
+  console.log(`        mean diffraction loss ${(diffSum / dif.diff.length).toFixed(2)} dB`);
 
   console.log(`\n${failures === 0 ? 'All live checks passed.' : `${failures} live check(s) FAILED.`}`);
   process.exit(failures === 0 ? 0 : 1);
