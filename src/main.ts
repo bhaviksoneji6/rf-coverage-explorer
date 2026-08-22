@@ -4,6 +4,7 @@ import './styles.css';
 
 import {
   aoiKey,
+  fitAoiToSites,
   makeAoi,
   makeCoverageGrid,
   radialParams,
@@ -13,6 +14,7 @@ import {
 } from './geo/aoi.js';
 import { toUtm } from './geo/utm.js';
 import { EngineClient } from './engine/client.js';
+import { aggregate, type AggregateResult } from './engine/aggregate.js';
 import { estimateCost, formatCost } from './engine/cost.js';
 import { computeProfile } from './engine/profile.js';
 import { sampleNearest } from './engine/sampler.js';
@@ -20,14 +22,26 @@ import { DEFAULT_K_FACTOR, type SiteGrid, type TerrainGridSpec } from './engine/
 import { NlcdProvider } from './providers/clutter/nlcd.js';
 import { Usgs3depProvider } from './providers/terrain/usgs3dep.js';
 import { CLUTTER_COLORS } from './providers/types.js';
-import { rasterize } from './render/colormap.js';
+import { hexToRgb, rasterize, rasterizeCategorical } from './render/colormap.js';
 import { clutterToRgba, hillshadeToRgba } from './render/hillshade.js';
 import { aoiCorners, RasterOverlay, type Corners } from './render/rasterLayer.js';
+import { isCoChannel, noiseFloorDbm } from './models/linkBudget.js';
+import { makeSite, siteColor } from './store/sites.js';
 import { createStore } from './store/store.js';
-import { DEFAULT_STATE, LOSS_SCALE_MAX_DB, STAGE_FOR, type AppState, type Site } from './store/types.js';
+import {
+  DEFAULT_STATE,
+  isNetworkKpi,
+  LOSS_SCALE_MAX_DB,
+  SINR_SCALE_MAX_DB,
+  SINR_SCALE_MIN_DB,
+  STAGE_FOR,
+  type AppState,
+  type Site,
+} from './store/types.js';
 import { buildControls } from './ui/controls.js';
 import { renderLegend } from './ui/legend.js';
 import { createProfileChart } from './ui/profile.js';
+import { createSiteList } from './ui/siteList.js';
 
 const BASEMAP = 'https://tiles.openfreemap.org/styles/positron';
 const START = { lon: -122.33, lat: 47.61, zoom: 10.2 };
@@ -54,6 +68,11 @@ interface Ctx {
   /** Clutter class per coverage bin, resampled from the AOI raster once per grid change. */
   binClutter: Uint8Array | null;
   kpiValues: Float32Array | null;
+  /** Site index per bin for the categorical serving layer. */
+  servingValues: Int16Array | null;
+  /** Per-site received level, kept so the hover readout can list every site at a point. */
+  contributors: { site: Site; index: number; rsl: Float32Array }[];
+  aggregate: AggregateResult | null;
   rgba: Uint8ClampedArray<ArrayBuffer> | null;
   demRgba: Uint8ClampedArray<ArrayBuffer> | null;
   /** Identity of the AOI currently loaded, so a redundant trigger cannot refetch. */
@@ -70,6 +89,9 @@ const ctx: Ctx = {
   signatures: new Map(),
   binClutter: null,
   kpiValues: null,
+  servingValues: null,
+  contributors: [],
+  aggregate: null,
   rgba: null,
   demRgba: null,
   loadedKey: null,
@@ -232,9 +254,19 @@ store.on('propagation', async (s) => {
   }
 
   const t0 = performance.now();
-  let computed = 0;
   let reused = 0;
 
+  const gridSpec = {
+    width: coverage.size.width,
+    height: coverage.size.height,
+    minE: coverage.bbox.minE,
+    maxN: coverage.bbox.maxN,
+    binM: coverage.binM,
+  };
+
+  // Work out what actually needs computing before dispatching any of it, so the pool can
+  // run the stale sites concurrently instead of one after another.
+  const jobs: { site: Site; signature: string }[] = [];
   for (const site of s.sites) {
     if (!site.enabled) continue;
 
@@ -255,59 +287,62 @@ store.on('propagation', async (s) => {
       reused++;
       continue;
     }
+    jobs.push({ site, signature });
+  }
 
-    const p = toUtm({ lon: site.lon, lat: site.lat }, aoi.zone);
-    const out = await engine.compute(
-      site.id,
-      {
-        txE: p.e,
-        txN: p.n,
-        txHeightAglM: site.txHeightM,
-        rxHeightAglM: s.rxHeightM,
-        freqMHz: site.freqMHz,
-        model: s.model,
-        nRadials: rp.nRadials,
-        nSteps: rp.nSteps,
-        stepM: rp.stepM,
-        kFactor: DEFAULT_K_FACTOR,
-      },
-      {
-        width: coverage.size.width,
-        height: coverage.size.height,
-        minE: coverage.bbox.minE,
-        maxN: coverage.bbox.maxN,
-        binM: coverage.binM,
-      },
+  if (jobs.length > 0) {
+    controls.setStatus(
+      `Computing ${jobs.length} site${jobs.length > 1 ? 's' : ''}…`,
+      'busy',
     );
+  }
+
+  const results = await Promise.all(
+    jobs.map(async ({ site, signature }) => {
+      const p = toUtm({ lon: site.lon, lat: site.lat }, aoi.zone);
+      const out = await engine.compute(
+        site.id,
+        {
+          txE: p.e,
+          txN: p.n,
+          txHeightAglM: site.txHeightM,
+          rxHeightAglM: s.rxHeightM,
+          freqMHz: site.freqMHz,
+          model: s.model,
+          nRadials: rp.nRadials,
+          nSteps: rp.nSteps,
+          stepM: rp.stepM,
+          kFactor: DEFAULT_K_FACTOR,
+        },
+        gridSpec,
+      );
+      return { site, signature, out };
+    }),
+  );
+
+  let computed = 0;
+  for (const { site, signature, out } of results) {
     // null means a newer request for this site superseded ours, or the worker errored.
     // Leave the signature unset either way, so the next pass retries rather than caching
     // a result that was never stored.
-    if (out) {
-      ctx.grids.set(site.id, out);
-      ctx.signatures.set(site.id, signature);
-      computed++;
-    }
+    if (!out) continue;
+    ctx.grids.set(site.id, out);
+    ctx.signatures.set(site.id, signature);
+    computed++;
   }
 
   const ms = Math.round(performance.now() - t0);
   controls.setStatus(
     `${coverage.size.width}x${coverage.size.height} bins at ${coverage.binM.toFixed(0)} m · ` +
       `${rp.nRadials} radials x ${rp.nSteps} steps · ` +
-      `${computed} computed${reused ? `, ${reused} reused` : ''} · ${ms} ms`,
+      `${computed} computed${reused ? `, ${reused} reused` : ''}` +
+      `${computed > 1 ? ` on ${engine.size} workers` : ''} · ${ms} ms`,
   );
 });
 
 // --- Stage: link budget (Class 1, recombine) --------------------------------------------
 
 store.on('linkBudget', (s) => {
-  const site = selectedSite(s);
-  const grid = site ? ctx.grids.get(site.id) : undefined;
-  if (!site || !grid) {
-    ctx.kpiValues = null;
-    return;
-  }
-
-  const n = grid.pathLoss.length;
   const binClutter = ctx.binClutter;
 
   // Clutter loss per receive bin. Applying it here rather than in the radial walk is what
@@ -318,32 +353,101 @@ store.on('linkBudget', (s) => {
     return s.clutterLossDb[binClutter[i] as number] ?? 0;
   };
 
-  const out = new Float32Array(n);
+  // Received level per enabled site. Isotropic for now: no antenna pattern, RX gain or
+  // feeder loss. Antenna gain will enter here rather than in propagation, because
+  // grid.elevAngle is already cached -- which is what makes downtilt instant in Pass 4.
+  const contributors: { site: Site; index: number; rsl: Float32Array }[] = [];
+  s.sites.forEach((site, index) => {
+    const grid = ctx.grids.get(site.id);
+    if (!site.enabled || !grid) return;
+    const n = grid.pathLoss.length;
+    const rsl = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      rsl[i] = site.eirpDbm - (grid.pathLoss[i] as number) - clutterAt(i);
+    }
+    contributors.push({ site, index, rsl });
+  });
+
+  ctx.contributors = contributors;
+  ctx.aggregate = null;
+
+  if (contributors.length === 0) {
+    ctx.kpiValues = null;
+    ctx.servingValues = null;
+    return;
+  }
+
+  const binCount = (contributors[0] as { rsl: Float32Array }).rsl.length;
+
+  if (isNetworkKpi(s.kpi)) {
+    const agg = aggregate({
+      rsl: contributors.map((c) => c.rsl),
+      freqMHz: contributors.map((c) => c.site.freqMHz),
+      bandwidthMHz: s.bandwidthMHz,
+      noiseDbm: noiseFloorDbm(s.bandwidthMHz, s.noiseFigureDb),
+      serviceThresholdDbm: s.threshold,
+      binCount,
+    });
+    ctx.aggregate = agg;
+    ctx.servingValues = null;
+    ctx.kpiValues = null;
+
+    switch (s.kpi) {
+      case 'bestRsl':
+        ctx.kpiValues = agg.bestRsl;
+        break;
+      case 'sinr':
+        ctx.kpiValues = agg.sinr;
+        break;
+      case 'overlap': {
+        const out = new Float32Array(binCount);
+        for (let i = 0; i < binCount; i++) {
+          out[i] = agg.serving[i] === -1 ? NaN : (agg.overlap[i] as number);
+        }
+        ctx.kpiValues = out;
+        break;
+      }
+      case 'serving':
+        // Categorical: rendered from site indices, not from a ramp.
+        ctx.servingValues = agg.serving;
+        break;
+    }
+    return;
+  }
+
+  // Per-site layers describe whichever site is selected.
+  ctx.servingValues = null;
+  const site = selectedSite(s);
+  const grid = site ? ctx.grids.get(site.id) : undefined;
+  if (!site || !grid) {
+    ctx.kpiValues = null;
+    return;
+  }
+
+  const n = grid.pathLoss.length;
 
   if (s.kpi === 'diffraction') {
     ctx.kpiValues = grid.diffraction;
     return;
   }
 
+  const out = new Float32Array(n);
+
   if (s.kpi === 'clutter') {
     for (let i = 0; i < n; i++) {
       out[i] = Number.isFinite(grid.pathLoss[i] as number) ? clutterAt(i) : NaN;
     }
-    ctx.kpiValues = out;
-    return;
-  }
-
-  if (s.kpi === 'pathLoss') {
+  } else if (s.kpi === 'pathLoss') {
     for (let i = 0; i < n; i++) out[i] = (grid.pathLoss[i] as number) + clutterAt(i);
-    ctx.kpiValues = out;
-    return;
-  }
-
-  // Received level. Isotropic for now: no antenna pattern, RX gain or feeder loss.
-  // Antenna gain will enter here rather than in propagation, because grid.elevAngle is
-  // already cached -- which is what will make downtilt an instant control in Pass 4.
-  for (let i = 0; i < n; i++) {
-    out[i] = site.eirpDbm - (grid.pathLoss[i] as number) - clutterAt(i);
+  } else {
+    const own = contributors.find((c) => c.site.id === site.id);
+    if (own) {
+      ctx.kpiValues = own.rsl;
+      return;
+    }
+    for (let i = 0; i < n; i++) {
+      out[i] = site.eirpDbm - (grid.pathLoss[i] as number) - clutterAt(i);
+    }
   }
   ctx.kpiValues = out;
 });
@@ -357,21 +461,57 @@ store.on('render', (s) => {
 
   // Coverage
   const coverage = ctx.coverage;
-  if (s.showCoverage && ctx.kpiValues && coverage) {
+  const haveLayer = ctx.kpiValues ?? ctx.servingValues;
+  if (s.showCoverage && haveLayer && coverage) {
     const n = coverage.size.width * coverage.size.height;
     ctx.rgba = ensureBuffer(ctx.rgba, n);
-    // Three different scales: received level uses the dBm range directly; total path loss
-    // reuses it inverted so dark still means "better"; the diagnostic loss layers get their
-    // own fixed 0..40 dB scale, where dark means "more loss here".
-    const isLossLayer = s.kpi === 'diffraction' || s.kpi === 'clutter';
-    const isPathLoss = s.kpi === 'pathLoss';
-    rasterize(ctx.kpiValues, ctx.rgba, {
-      min: isLossLayer ? 0 : isPathLoss ? -s.maxDbm : s.minDbm,
-      max: isLossLayer ? LOSS_SCALE_MAX_DB : isPathLoss ? -s.minDbm : s.maxDbm,
-      ramp: s.ramp,
-      opacity: s.opacity,
-      ...(isLossLayer || isPathLoss ? {} : { threshold: s.threshold }),
-    });
+
+    if (s.kpi === 'serving' && ctx.servingValues) {
+      // Identity, not magnitude: a straight lookup, and nearest-neighbour on the way to the
+      // GPU, because interpolating between two sites' colours would invent a third site.
+      const colors = s.sites.map((_, i) => hexToRgb(siteColor(i)));
+      const best = ctx.aggregate?.bestRsl;
+      rasterizeCategorical(ctx.servingValues, ctx.rgba, colors, s.opacity, (i) =>
+        best ? (best[i] as number) >= s.threshold : true,
+      );
+    } else if (ctx.kpiValues) {
+      // Four scales here: received level uses the dBm range directly; total path loss
+      // reuses it inverted so dark still means "better"; the loss diagnostics get a fixed
+      // 0..40 dB scale; overlap and SINR get their own natural ranges.
+      const isLossLayer = s.kpi === 'diffraction' || s.kpi === 'clutter';
+      const isPathLoss = s.kpi === 'pathLoss';
+      const isOverlap = s.kpi === 'overlap';
+      const isSinr = s.kpi === 'sinr';
+      const enabledCount = Math.max(1, s.sites.filter((x) => x.enabled).length);
+
+      let min = s.minDbm;
+      let max = s.maxDbm;
+      if (isLossLayer) {
+        min = 0;
+        max = LOSS_SCALE_MAX_DB;
+      } else if (isPathLoss) {
+        min = -s.maxDbm;
+        max = -s.minDbm;
+      } else if (isOverlap) {
+        min = 1;
+        max = enabledCount;
+      } else if (isSinr) {
+        min = SINR_SCALE_MIN_DB;
+        max = SINR_SCALE_MAX_DB;
+      }
+
+      // Threshold masking only makes sense for received levels; masking SINR or a loss by a
+      // dBm figure would hide bins for a reason unrelated to what is being drawn.
+      const masked = s.kpi === 'rsl' || s.kpi === 'bestRsl';
+      rasterize(ctx.kpiValues, ctx.rgba, {
+        min,
+        max,
+        ramp: s.ramp,
+        opacity: s.opacity,
+        ...(masked ? { threshold: s.threshold } : {}),
+      });
+    }
+
     coverageLayer ??= new RasterOverlay(map, 'coverage', { resampling: 'linear' });
     coverageLayer.update(ctx.rgba, coverage.size.width, coverage.size.height, corners);
     coverageLayer.setVisible(true);
@@ -411,56 +551,150 @@ store.on('render', (s) => {
 
 // --- Interaction ------------------------------------------------------------------------
 
-function placeOrMoveSite(lon: number, lat: number): void {
-  const s = store.get();
-  const existing = selectedSite(s);
+/**
+ * Reconcile the AOI with the current set of sites.
+ *
+ * Recenters on the sites' bounding box when any of them has drifted past the edge margin,
+ * but never grows the AOI: the pixel budget is fixed, so growing it would silently coarsen
+ * the DEM -- a distant site could drop terrain from 30 m to 80 m without saying so. When the
+ * sites genuinely do not fit, it says so and leaves the size alone for the user to raise.
+ *
+ * Returns the patch to apply, so callers can decide the stage.
+ */
+function aoiPatchFor(sites: readonly Site[], sideM: number): Partial<AppState> | null {
+  const live = sites.filter((x) => x.enabled);
+  if (live.length === 0) return null;
 
-  if (!existing) {
-    const site: Site = {
-      id: `site-${Date.now().toString(36)}`,
-      name: 'Site A',
-      lon,
-      lat,
-      enabled: true,
-      freqMHz: 3700,
-      eirpDbm: 55,
-      txHeightM: 30,
-    };
-    addMarker(site);
-    store.set({ sites: [...s.sites, site], selectedSiteId: site.id, aoiCenter: { lon, lat } });
-    return;
-  }
-
-  const moved: Site = { ...existing, lon, lat };
-  const sites = s.sites.map((x) => (x.id === moved.id ? moved : x));
-  markers.get(moved.id)?.setLngLat([lon, lat]);
-
-  // The AOI is a study area, not a follow-cam. Terrain is loaded for the whole box, so a
-  // site moving anywhere inside it is a Class 2 recompute with no network access at all --
-  // only a site pushed out to the edge earns a reload.
   const aoi = ctx.aoi;
   if (aoi) {
-    const p = toUtm({ lon, lat }, aoi.zone);
-    if (!siteNeedsNewAoi(aoi, p.e, p.n)) {
-      store.set({ sites }, 'propagation');
-      return;
+    const allInside = live.every((site) => {
+      const p = toUtm({ lon: site.lon, lat: site.lat }, aoi.zone);
+      return !siteNeedsNewAoi(aoi, p.e, p.n);
+    });
+    if (allInside) return null;
+  }
+
+  const fit = fitAoiToSites(live);
+  if (!fit) return null;
+
+  if (fit.requiredSideM > sideM) {
+    controls.setStatus(
+      `Sites span ${(fit.spanM / 1000).toFixed(1)} km but the area is ${(sideM / 1000).toFixed(1)} km. ` +
+        `Raise AOI size to at least ${Math.ceil(fit.requiredSideM / 1000)} km, or the outer sites will sit at the edge.`,
+      'error',
+    );
+  }
+  return { aoiCenter: fit.center };
+}
+
+function syncMarkers(sites: readonly Site[]): void {
+  for (const [id, marker] of markers) {
+    if (!sites.some((s) => s.id === id)) {
+      marker.remove();
+      markers.delete(id);
     }
   }
-  store.set({ sites, aoiCenter: { lon, lat } });
-}
-
-function addMarker(site: Site): void {
-  const marker = new maplibregl.Marker({ color: '#2a78d6', draggable: true })
-    .setLngLat([site.lon, site.lat])
-    .addTo(map);
-  marker.on('dragend', () => {
-    const { lng, lat } = marker.getLngLat();
-    placeOrMoveSite(lng, lat);
+  sites.forEach((site, i) => {
+    const existing = markers.get(site.id);
+    if (existing) {
+      existing.setLngLat([site.lon, site.lat]);
+      const el = existing.getElement();
+      el.style.opacity = site.enabled ? '1' : '0.35';
+      el.title = site.name;
+      return;
+    }
+    // Name on the marker itself: on a categorical serving map past three sites, colour
+    // alone is not enough to tell neighbours apart.
+    const marker = new maplibregl.Marker({ color: siteColor(i), draggable: true })
+      .setLngLat([site.lon, site.lat])
+      .setPopup(new maplibregl.Popup({ closeButton: false, offset: 12 }).setText(site.name))
+      .addTo(map);
+    marker.getElement().title = site.name;
+    marker.on('dragend', () => {
+      const { lng, lat } = marker.getLngLat();
+      moveSite(site.id, lng, lat);
+    });
+    marker.getElement().addEventListener('click', () => selectSite(site.id));
+    markers.set(site.id, marker);
   });
-  markers.set(site.id, marker);
 }
 
-map.on('click', (ev) => placeOrMoveSite(ev.lngLat.lng, ev.lngLat.lat));
+function moveSite(id: string, lon: number, lat: number): void {
+  const s = store.get();
+  const sites = s.sites.map((x) => (x.id === id ? { ...x, lon, lat } : x));
+  syncMarkers(sites);
+
+  const patch = aoiPatchFor(sites, s.aoiSideM);
+  // Inside the loaded box this is a Class 2 recompute with no network access at all.
+  if (patch) store.set({ sites, ...patch });
+  else store.set({ sites }, 'propagation');
+}
+
+function selectSite(id: string): void {
+  store.set({ selectedSiteId: id }, 'linkBudget');
+  siteList.render();
+}
+
+function addSiteAt(lon: number, lat: number): void {
+  const s = store.get();
+  const site = makeSite(lon, lat, s.sites, selectedSite(s));
+  const sites = [...s.sites, site];
+  syncMarkers(sites);
+  const patch = aoiPatchFor(sites, s.aoiSideM);
+  store.set({ sites, selectedSiteId: site.id, placing: false, ...patch });
+  siteList.render();
+}
+
+function removeSite(id: string): void {
+  const s = store.get();
+  const sites = s.sites.filter((x) => x.id !== id);
+  ctx.grids.delete(id);
+  ctx.signatures.delete(id);
+  syncMarkers(sites);
+  const selectedSiteId = s.selectedSiteId === id ? (sites[0]?.id ?? null) : s.selectedSiteId;
+  store.set({ sites, selectedSiteId }, 'propagation');
+  siteList.render();
+}
+
+function setPlacing(on: boolean): void {
+  store.set({ placing: on });
+  map.getCanvasContainer().classList.toggle('placing', on);
+  document.getElementById('map')?.classList.toggle('placing', on);
+  siteList.render();
+  if (on) controls.setStatus('Click the map to place the new site. Press Esc to cancel.', 'busy');
+}
+
+const siteList = createSiteList(controls.siteListHost, store, {
+  onSelect: selectSite,
+  onRemove: removeSite,
+  onToggle: (id, enabled) => {
+    const s = store.get();
+    const sites = s.sites.map((x) => (x.id === id ? { ...x, enabled } : x));
+    syncMarkers(sites);
+    store.set({ sites }, 'propagation');
+    siteList.render();
+  },
+  onRename: (id, name) => {
+    const s = store.get();
+    store.set({ sites: s.sites.map((x) => (x.id === id ? { ...x, name } : x)) }, 'render');
+    syncMarkers(store.get().sites);
+    siteList.render();
+  },
+  onStartPlacing: () => setPlacing(!store.get().placing),
+});
+
+// Placement is modal by choice: inspecting the map is constant, creating a site is not, so
+// a stray click must never make one.
+map.on('click', (ev) => {
+  if (!store.get().placing) return;
+  addSiteAt(ev.lngLat.lng, ev.lngLat.lat);
+  map.getCanvasContainer().classList.remove('placing');
+  document.getElementById('map')?.classList.remove('placing');
+});
+
+window.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && store.get().placing) setPlacing(false);
+});
 
 // --- Hover path profile ------------------------------------------------------------------
 
@@ -489,11 +723,34 @@ function scheduleProfile(): void {
   });
 }
 
+/** Coverage-grid bin index under a lon/lat, or -1 when outside the grid. */
+function binIndexAt(lon: number, lat: number): number {
+  const aoi = ctx.aoi;
+  const cov = ctx.coverage;
+  if (!aoi || !cov) return -1;
+  const p = toUtm({ lon, lat }, aoi.zone);
+  const i = Math.floor((p.e - cov.bbox.minE) / cov.binM);
+  const j = Math.floor((cov.bbox.maxN - p.n) / cov.binM);
+  if (i < 0 || j < 0 || i >= cov.size.width || j >= cov.size.height) return -1;
+  return j * cov.size.width + i;
+}
+
 function drawProfile(): void {
   const s = store.get();
-  const site = selectedSite(s);
   const aoi = ctx.aoi;
-  if (!site || !aoi || !ctx.terrain || !hoverLonLat) {
+  if (!aoi || !ctx.terrain || !hoverLonLat) {
+    profileEl.hidden = true;
+    return;
+  }
+
+  // The profile follows whichever site actually serves the hovered point, so "why is
+  // coverage bad here" is answered by the path that matters rather than by whichever site
+  // happens to be selected in the panel. Falls back to the selection when nothing serves.
+  const bin = binIndexAt(hoverLonLat.lon, hoverLonLat.lat);
+  const servingIdx = bin >= 0 ? (ctx.aggregate?.serving[bin] ?? -1) : -1;
+  const site =
+    servingIdx >= 0 ? (ctx.contributors[servingIdx]?.site ?? null) : selectedSite(s);
+  if (!site) {
     profileEl.hidden = true;
     return;
   }
@@ -517,11 +774,36 @@ function drawProfile(): void {
   const rxClass = profile.clutter ? (profile.clutter[profile.clutter.length - 1] as number) : 0;
   const clutterLossDb = s.applyClutter ? (s.clutterLossDb[rxClass] ?? 0) : 0;
 
+  // Every site's level at this point, so interference is legible rather than implied.
+  const others =
+    bin >= 0
+      ? ctx.contributors
+          .map((c) => ({
+            name: c.site.name,
+            color: siteColor(c.index),
+            rslDbm: c.rsl[bin] as number,
+            serving: c.index === servingIdx,
+            coChannel:
+              servingIdx >= 0 &&
+              c.index !== servingIdx &&
+              isCoChannel(
+                c.site.freqMHz,
+                ctx.contributors[servingIdx]?.site.freqMHz ?? c.site.freqMHz,
+                s.bandwidthMHz,
+              ),
+          }))
+          .filter((c) => Number.isFinite(c.rslDbm))
+          .sort((a, b) => b.rslDbm - a.rslDbm)
+      : [];
+
   profileEl.hidden = false;
   profileChart.draw(profile, {
     freqMHz: site.freqMHz,
     eirpDbm: site.eirpDbm,
     clutterLossDb,
+    servingName: site.name,
+    sinrDb: bin >= 0 ? (ctx.aggregate?.sinr[bin] ?? null) : null,
+    sites: others,
   });
 }
 

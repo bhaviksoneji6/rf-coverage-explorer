@@ -162,7 +162,31 @@ function select<T extends string>(
   return sel;
 }
 
+/** Select with <optgroup>, so per-site and network layers are never confused. */
+function groupedSelect<T extends string>(
+  groups: { label: string; options: { value: T; label: string }[] }[],
+  value: T,
+  onChange: (v: T) => void,
+): HTMLElement {
+  const sel = el('select');
+  for (const g of groups) {
+    const og = document.createElement('optgroup');
+    og.label = g.label;
+    for (const o of g.options) {
+      const opt = el('option', undefined, o.label);
+      opt.value = o.value;
+      og.append(opt);
+    }
+    sel.append(og);
+  }
+  sel.value = value;
+  sel.addEventListener('change', () => onChange(sel.value as T));
+  return sel;
+}
+
 export interface ControlsHandle {
+  /** Container the site list mounts into. */
+  siteListHost: HTMLElement;
   syncSite(site: Site | null): void;
   setStatus(text: string, kind?: 'info' | 'busy' | 'error'): void;
   setCost(text: string, level: 'ok' | 'warn' | 'block'): void;
@@ -177,12 +201,18 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
     el(
       'p',
       'sub',
-      'Click the map to place a transmitter. Terrain and land cover are fetched once per area; everything else recomputes locally.',
+      'Add sites, then tune them. Terrain and land cover are fetched once per area; everything else recomputes locally.',
     ),
   );
 
+  // --- Sites ---
+  const sitesGroup = group('Sites', 'network');
+  const siteListHost = el('div');
+  sitesGroup.append(siteListHost);
+  root.append(sitesGroup);
+
   // --- Transmitter (Class 2: re-runs the radial walk) ---
-  const txGroup = group('Transmitter', 'recompute');
+  const txGroup = group('Selected site', 'recompute');
   const freq = slider({
     label: 'Frequency',
     min: 30,
@@ -224,7 +254,29 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
     decimals: 1,
     onInput: (v) => store.set({ rxHeightM: v }),
   });
-  txGroup.append(freq.root, txh.root, eirp.root, rxh.root);
+  const bw = slider({
+    label: 'Bandwidth',
+    min: 0.2,
+    max: 200,
+    step: 0.2,
+    value: s.bandwidthMHz,
+    unit: 'MHz',
+    decimals: 1,
+    // Class 1: sets the noise floor and the co-channel test, not the path loss.
+    onInput: (v) => store.set({ bandwidthMHz: v }),
+  });
+  const nf = slider({
+    label: 'Noise figure',
+    min: 0,
+    max: 20,
+    step: 0.5,
+    value: s.noiseFigureDb,
+    unit: 'dB',
+    decimals: 1,
+    onInput: (v) => store.set({ noiseFigureDb: v }),
+  });
+
+  txGroup.append(freq.root, txh.root, eirp.root, rxh.root, bw.root, nf.root);
   root.append(txGroup);
 
   // --- Propagation model (Class 2) ---
@@ -310,12 +362,26 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
   // --- Display (Class 0: pure re-colour) ---
   const dispGroup = group('Display', 'instant');
   dispGroup.append(
-    select<KpiName>(
+    groupedSelect<KpiName>(
       [
-        { value: 'rsl', label: 'Received level (dBm)' },
-        { value: 'pathLoss', label: 'Total path loss (dB)' },
-        { value: 'diffraction', label: 'Diffraction loss (dB)' },
-        { value: 'clutter', label: 'Clutter loss (dB)' },
+        {
+          label: 'Network',
+          options: [
+            { value: 'bestRsl', label: 'Best received level (dBm)' },
+            { value: 'serving', label: 'Serving site' },
+            { value: 'sinr', label: 'SINR (dB)' },
+            { value: 'overlap', label: 'Overlapping sites' },
+          ],
+        },
+        {
+          label: 'Selected site',
+          options: [
+            { value: 'rsl', label: 'Received level (dBm)' },
+            { value: 'pathLoss', label: 'Total path loss (dB)' },
+            { value: 'diffraction', label: 'Diffraction loss (dB)' },
+            { value: 'clutter', label: 'Clutter loss (dB)' },
+          ],
+        },
       ],
       s.kpi,
       (v) => store.set({ kpi: v }),
@@ -412,6 +478,7 @@ export function buildControls(root: HTMLElement, store: Store<AppState>): Contro
   }
 
   return {
+    siteListHost,
     syncSite(site: Site | null): void {
       if (!site) return;
       freq.sync(site.freqMHz);

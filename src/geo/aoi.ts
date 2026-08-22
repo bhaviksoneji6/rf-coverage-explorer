@@ -1,5 +1,5 @@
 import type { BBox, GridSize } from './bbox.js';
-import { toUtm, zoneFor, type LonLat, type UtmPoint, type UtmZone } from './utm.js';
+import { toLonLat, toUtm, zoneFor, type LonLat, type UtmPoint, type UtmZone } from './utm.js';
 
 /** 3DEP's native resolution. Requesting finer just interpolates, so we clamp here. */
 export const MIN_RES_M = 10;
@@ -95,6 +95,56 @@ export function siteNeedsNewAoi(aoi: Aoi, e: number, n: number, margin = AOI_EDG
     n < aoi.bbox.minN + inset ||
     n > aoi.bbox.maxN - inset
   );
+}
+
+export interface SitePoint {
+  lon: number;
+  lat: number;
+}
+
+export interface AoiFit {
+  /** Where the AOI should be centred to cover every site. */
+  center: SitePoint;
+  /** Widest span across the sites, metres -- the AOI must be at least this plus margin. */
+  spanM: number;
+  /** Smallest AOI side that would contain them all with the usual edge margin. */
+  requiredSideM: number;
+}
+
+/**
+ * Where to put the AOI so it covers every site.
+ *
+ * Returns the required size but never applies it: growing the AOI automatically would
+ * silently coarsen the DEM, because the pixel budget is fixed. A distant site would drop
+ * terrain from 30 m to 80 m without saying so, which is exactly the kind of quiet
+ * degradation that makes a result untrustworthy. The caller warns instead.
+ */
+export function fitAoiToSites(sites: readonly SitePoint[]): AoiFit | null {
+  if (sites.length === 0) return null;
+
+  const zone = zoneFor(sites[0] as SitePoint);
+  let minE = Infinity;
+  let maxE = -Infinity;
+  let minN = Infinity;
+  let maxN = -Infinity;
+
+  for (const s of sites) {
+    const p = toUtm(s, zone);
+    if (p.e < minE) minE = p.e;
+    if (p.e > maxE) maxE = p.e;
+    if (p.n < minN) minN = p.n;
+    if (p.n > maxN) maxN = p.n;
+  }
+
+  const spanM = Math.max(maxE - minE, maxN - minN);
+  const centre = toLonLat({ e: (minE + maxE) / 2, n: (minN + maxN) / 2 }, zone);
+
+  return {
+    center: centre,
+    spanM,
+    // The margin is applied on both sides, so the usable width is (1 - 2*margin) of the side.
+    requiredSideM: spanM / Math.max(0.05, 1 - 2 * AOI_EDGE_MARGIN),
+  };
 }
 
 /** Identity of a fetched AOI, so the data stage can skip work when nothing actually moved. */

@@ -1,6 +1,12 @@
 import { sampleRamp } from '../render/colormap.js';
 import { CLUTTER_COLORS, CLUTTER_NAMES } from '../providers/types.js';
-import { LOSS_SCALE_MAX_DB, type AppState } from '../store/types.js';
+import { siteColor } from '../store/sites.js';
+import {
+  LOSS_SCALE_MAX_DB,
+  SINR_SCALE_MAX_DB,
+  SINR_SCALE_MIN_DB,
+  type AppState,
+} from '../store/types.js';
 
 const CLUTTER_ORDER = [1, 2, 3, 4, 5, 6, 7];
 
@@ -19,12 +25,41 @@ export function renderLegend(root: HTMLElement, s: AppState): void {
 
   const KPI_TITLES: Record<string, string> = {
     rsl: 'Received level',
+    bestRsl: 'Best received level',
     pathLoss: 'Total path loss',
     diffraction: 'Diffraction loss',
     clutter: 'Clutter loss',
+    sinr: 'SINR',
+    serving: 'Serving site',
+    overlap: 'Overlapping sites',
   };
 
-  if (s.showCoverage) {
+  if (s.showCoverage && s.kpi === 'serving') {
+    const title = document.createElement('div');
+    title.className = 'legend-title';
+    title.textContent = 'Serving site';
+    root.append(title);
+
+    // Names, not just swatches. A serving-site map is categorical and any two colours can
+    // end up adjacent; past three sites the palette cannot carry identity by itself.
+    s.sites.forEach((site, i) => {
+      if (!site.enabled) return;
+      const row = document.createElement('div');
+      row.className = 'legend-row';
+      const sw = document.createElement('span');
+      sw.className = 'legend-swatch';
+      sw.style.background = siteColor(i);
+      const label = document.createElement('span');
+      label.textContent = `${site.name} · ${site.freqMHz} MHz`;
+      row.append(sw, label);
+      root.append(row);
+    });
+
+    const note = document.createElement('div');
+    note.style.marginTop = '5px';
+    note.textContent = `Served above ${s.threshold} dBm`;
+    root.append(note);
+  } else if (s.showCoverage) {
     const title = document.createElement('div');
     title.className = 'legend-title';
     title.textContent = KPI_TITLES[s.kpi] ?? 'Coverage';
@@ -42,12 +77,23 @@ export function renderLegend(root: HTMLElement, s: AppState): void {
 
     const ticks = document.createElement('div');
     ticks.className = 'legend-ticks';
-    const unit = s.kpi === 'rsl' ? 'dBm' : 'dB';
+    const unit = s.kpi === 'rsl' || s.kpi === 'bestRsl' ? 'dBm' : s.kpi === 'overlap' ? 'sites' : 'dB';
     // Loss layers are drawn on their own fixed scale, not the dBm range, so the legend has
     // to say so rather than showing received-level numbers against a loss ramp.
     const isLossLayer = s.kpi === 'diffraction' || s.kpi === 'clutter';
-    const lo = isLossLayer ? 0 : s.minDbm;
-    const hi = isLossLayer ? LOSS_SCALE_MAX_DB : s.maxDbm;
+    const enabledCount = Math.max(1, s.sites.filter((x) => x.enabled).length);
+    let lo = s.minDbm;
+    let hi = s.maxDbm;
+    if (isLossLayer) {
+      lo = 0;
+      hi = LOSS_SCALE_MAX_DB;
+    } else if (s.kpi === 'sinr') {
+      lo = SINR_SCALE_MIN_DB;
+      hi = SINR_SCALE_MAX_DB;
+    } else if (s.kpi === 'overlap') {
+      lo = 1;
+      hi = enabledCount;
+    }
     const mid = Math.round((lo + hi) / 2);
     for (const [i, v] of [lo, mid, hi].entries()) {
       const t = document.createElement('span');
@@ -56,7 +102,7 @@ export function renderLegend(root: HTMLElement, s: AppState): void {
     }
     root.append(ticks);
 
-    if (!isLossLayer && s.threshold > s.minDbm) {
+    if ((s.kpi === 'rsl' || s.kpi === 'bestRsl') && s.threshold > s.minDbm) {
       const note = document.createElement('div');
       note.style.marginTop = '5px';
       note.textContent = `Hidden below ${s.threshold} dBm`;

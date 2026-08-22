@@ -50,8 +50,26 @@ function inkFor(dark: boolean): Ink {
       };
 }
 
+export interface SiteLevel {
+  name: string;
+  color: string;
+  rslDbm: number;
+  serving: boolean;
+  coChannel: boolean;
+}
+
+export interface ProfileOpts {
+  freqMHz: number;
+  eirpDbm: number;
+  clutterLossDb: number;
+  servingName?: string;
+  sinrDb?: number | null;
+  /** Every site's level at this point, strongest first. */
+  sites?: SiteLevel[];
+}
+
 export interface ProfileChart {
-  draw(p: Profile | null, opts: { freqMHz: number; eirpDbm: number; clutterLossDb: number }): void;
+  draw(p: Profile | null, opts: ProfileOpts): void;
   destroy(): void;
 }
 
@@ -61,7 +79,7 @@ export function createProfileChart(canvas: HTMLCanvasElement, readout: HTMLEleme
   // Re-bind after the guard: TypeScript drops the narrowing inside the nested draw closure.
   const ctx: CanvasRenderingContext2D = maybeCtx;
 
-  let last: { p: Profile | null; o: Parameters<ProfileChart['draw']>[1] } | null = null;
+  let last: { p: Profile | null; o: ProfileOpts } | null = null;
 
   const media = window.matchMedia('(prefers-color-scheme: dark)');
   const onScheme = () => {
@@ -69,7 +87,7 @@ export function createProfileChart(canvas: HTMLCanvasElement, readout: HTMLEleme
   };
   media.addEventListener('change', onScheme);
 
-  function draw(p: Profile | null, o: Parameters<ProfileChart['draw']>[1]): void {
+  function draw(p: Profile | null, o: ProfileOpts): void {
     last = { p, o };
 
     const dpr = window.devicePixelRatio || 1;
@@ -253,6 +271,7 @@ export function createProfileChart(canvas: HTMLCanvasElement, readout: HTMLEleme
       wrap.append(l, v);
       readout.append(wrap);
     };
+    if (o.servingName) add('Serving', o.servingName);
     add('Distance', `${(p.totalM / 1000).toFixed(2)} km`);
     add('Path', p.los ? 'Line of sight' : 'Obstructed', p.los ? undefined : ink.edge);
     add('Clearance', `${p.worstClearance >= 10 ? '>10' : p.worstClearance.toFixed(2)} F1`);
@@ -261,7 +280,30 @@ export function createProfileChart(canvas: HTMLCanvasElement, readout: HTMLEleme
     add('Clutter', `${o.clutterLossDb.toFixed(1)} dB`);
     add('Total loss', `${total.toFixed(1)} dB`);
     add('RSL', `${rsl.toFixed(1)} dBm`);
+    if (o.sinrDb != null && Number.isFinite(o.sinrDb)) add('SINR', `${o.sinrDb.toFixed(1)} dB`);
     if (p.clutter) add('Ground', CLUTTER_NAMES[cls] ?? '—');
+
+    // Colour chip plus name plus number: on a categorical map past three sites, hue alone
+    // cannot be relied on, so the name is always present next to it.
+    if (o.sites && o.sites.length > 1) {
+      for (const site of o.sites) {
+        const wrap = document.createElement('span');
+        wrap.className = 'pf-stat';
+        const chip = document.createElement('span');
+        chip.className = 'pf-chip';
+        chip.style.background = site.color;
+        const l = document.createElement('span');
+        l.className = 'pf-label';
+        l.textContent = site.serving ? `${site.name} (serving)` : site.name;
+        const v = document.createElement('span');
+        v.className = 'pf-value';
+        v.textContent = `${site.rslDbm.toFixed(1)}`;
+        if (site.coChannel) v.title = 'Co-channel interferer';
+        if (!site.serving && !site.coChannel) v.style.opacity = '0.55';
+        wrap.append(chip, l, v);
+        readout.append(wrap);
+      }
+    }
   }
 
   return {

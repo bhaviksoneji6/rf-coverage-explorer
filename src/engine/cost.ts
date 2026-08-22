@@ -75,8 +75,9 @@ function rawCost(input: CostInput): { bins: number; radialSamples: number; bytes
   const bytes =
     // pathLoss + diffraction + elevAngle over the radial fan, transient in the worker
     3 * 4 * radialSamples +
-    // the same three per site on the output grid, held for the session
-    3 * 4 * bins * siteCount +
+    // the same three per site on the output grid, plus that site's received level,
+    // all held for the session
+    4 * 4 * bins * siteCount +
     // clutter class per bin, plus the derived KPI grid and its RGBA rendering
     1 * bins +
     4 * bins +

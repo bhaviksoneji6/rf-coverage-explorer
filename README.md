@@ -9,9 +9,9 @@ The goal is **interaction speed, not prediction accuracy**. There are plenty of 
 model propagation rigorously and slowly; the point of this one is to drag a transmitter,
 retune a frequency, and watch the map change immediately.
 
-> **Status: Pass 2.** Terrain diffraction, per-bin clutter loss and the hover path-profile
-> panel are live. Multi-site aggregation and antenna patterns are scaffolded but not
-> implemented. See [Roadmap](#roadmap).
+> **Status: Pass 3.** Multi-site networks with best-server, SINR and overlap layers are
+> live, on top of Pass 2's terrain diffraction and path profile. Antenna patterns are
+> scaffolded but not implemented. See [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -59,6 +59,39 @@ Two things about the diffraction that are worth stating because they surprise pe
 Known limitation, and the reason this is Model 1 rather than the destination: a single edge
 under-predicts loss when several obstacles block a path. Delta-Bullington is the fix, and it
 is the same horizon walk feeding it.
+
+### Multi-site
+
+Sites are independent radial walks combined in the link-budget stage, so every network layer
+is Class 1 -- retuning a frequency or nudging an EIRP recombines cached path loss and never
+re-walks a radial.
+
+| Layer | |
+|---|---|
+| Best received level | strongest server per bin |
+| Serving site | which site wins, categorical |
+| SINR | `P_serving / (Σ co-channel interferers + N)` in linear power |
+| Overlapping sites | how many exceed the service threshold — pilot pollution |
+
+Noise floor is `-174 + 10log₁₀(B) + NF`; two sites interfere only when their centre
+frequencies are closer than one channel width. That rule is what makes frequency planning
+visible: drop four co-channel sites and SINR collapses toward 0 dB, retune three and it
+recovers past 20 dB.
+
+Placement is modal — a `+ Add site` button arms the map, the next click places. Inspecting
+the map is a constant activity and creating a site is not, so a stray click must never make
+one.
+
+The AOI recentres to cover every site but **never grows automatically**. The pixel budget is
+fixed, so growing it would silently coarsen the DEM — a distant site could drop terrain from
+30 m to 80 m without saying so. When sites genuinely do not fit, it says so and names the
+size needed.
+
+**Known limitation, stated rather than hidden:** the serving-site layer is a categorical map
+where any two colours can end up adjacent, and the validated palette only clears the
+all-pairs accessibility gates for three slots. Past three sites, colour alone cannot carry
+identity. Every site therefore shows its name on its map marker, in the legend, and in the
+hover readout — the same trade the NLCD land-cover layer makes.
 
 ### Radial walk, not per-bin profiles
 
@@ -213,8 +246,6 @@ Beyond `npm run test`, the vertical slice is checked visually:
 
 ## Roadmap
 
-- **Pass 3** — multi-site: site list, per-site frequency, best-server / SINR / overlap-count
-  aggregation, SharedArrayBuffer and a worker pool.
 - **Pass 4** — ITU-R F.1336 antenna patterns (applied in the link-budget stage, so downtilt
   stays instant), full budget through SNR to throughput KPI maps, A/B compare.
 

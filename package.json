@@ -1,6 +1,6 @@
 {
   "name": "rf-coverage-explorer",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Interactive browser tool for visualising RF coverage and KPI maps over real terrain and land cover.",
   "author": "Bhavik Soneji <bhaviksoneji6@gmail.com>",

@@ -16,7 +16,21 @@ export interface Site {
 /** Loss layers use their own 0..N dB scale rather than the received-level range. */
 export const LOSS_SCALE_MAX_DB = 40;
 
-export type KpiName = 'rsl' | 'pathLoss' | 'diffraction' | 'clutter';
+/** SINR display range. Below -5 dB nothing decodes; above 30 dB the extra is not useful. */
+export const SINR_SCALE_MIN_DB = -5;
+export const SINR_SCALE_MAX_DB = 30;
+
+/** Layers that describe one selected site. */
+export type SiteKpi = 'rsl' | 'pathLoss' | 'diffraction' | 'clutter';
+/** Layers that describe the network as a whole. */
+export type NetworkKpi = 'bestRsl' | 'serving' | 'sinr' | 'overlap';
+export type KpiName = SiteKpi | NetworkKpi;
+
+export const NETWORK_KPIS: readonly KpiName[] = ['bestRsl', 'serving', 'sinr', 'overlap'];
+
+export function isNetworkKpi(k: KpiName): boolean {
+  return NETWORK_KPIS.includes(k);
+}
 
 /**
  * Default clutter loss per normalised class, dB, at roughly 1-2 GHz.
@@ -49,6 +63,13 @@ export interface AppState {
   rxHeightM: number;
   model: PropagationModel;
 
+  /** Receiver channel, used for the noise floor and for the co-channel test. */
+  bandwidthMHz: number;
+  noiseFigureDb: number;
+
+  /** True while the map is waiting for a click to place a new site. */
+  placing: boolean;
+
   /** Applied per receive bin in the link budget, so editing the table is instant. */
   applyClutter: boolean;
   clutterLossDb: Record<number, number>;
@@ -77,6 +98,9 @@ export const DEFAULT_STATE: AppState = {
   binM: 50,
   rxHeightM: 1.5,
   model: 'diffraction',
+  bandwidthMHz: 20,
+  noiseFigureDb: 7,
+  placing: false,
   applyClutter: true,
   clutterLossDb: { ...DEFAULT_CLUTTER_LOSS_DB },
   kpi: 'rsl',
@@ -112,6 +136,8 @@ export const STAGE_FOR: Partial<Record<keyof AppState, Stage>> = {
   // re-walks a radial. That is what makes dragging a clutter value feel instant.
   applyClutter: 'linkBudget',
   clutterLossDb: 'linkBudget',
+  bandwidthMHz: 'linkBudget',
+  noiseFigureDb: 'linkBudget',
 
   // Class 1: recombines cached path loss into a received level.
   selectedSiteId: 'linkBudget',
@@ -121,11 +147,13 @@ export const STAGE_FOR: Partial<Record<keyof AppState, Stage>> = {
   ramp: 'render',
   minDbm: 'render',
   maxDbm: 'render',
-  threshold: 'render',
+  // The display threshold doubles as the service threshold, so overlap counts change with it.
+  threshold: 'linkBudget',
   opacity: 'render',
   showCoverage: 'render',
   showHillshade: 'render',
   showClutter: 'render',
+  placing: 'render',
   status: 'render',
   busy: 'render',
   lastComputeMs: 'render',

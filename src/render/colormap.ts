@@ -77,6 +77,47 @@ export function sampleRamp(name: RampName, t: number): [number, number, number] 
   ];
 }
 
+/**
+ * Categorical raster, for the serving-site layer.
+ *
+ * Separate from `rasterize` because identity is not magnitude: interpolating between site
+ * colours would invent sites that do not exist, so this is a straight lookup with no ramp.
+ * `mask` suppresses bins that fail the service threshold, so unserved area shows the
+ * basemap rather than a colour implying somebody serves it.
+ */
+export function rasterizeCategorical(
+  values: Int16Array,
+  out: Uint8ClampedArray<ArrayBuffer>,
+  colors: [number, number, number][],
+  opacity: number,
+  mask?: (i: number) => boolean,
+): Uint8ClampedArray<ArrayBuffer> {
+  const alpha = Math.round(Math.max(0, Math.min(1, opacity)) * 255);
+  for (let i = 0; i < values.length; i++) {
+    const idx = values[i] as number;
+    const o = i * 4;
+    const rgb = idx >= 0 ? colors[idx % colors.length] : undefined;
+    if (!rgb || (mask && !mask(i))) {
+      out[o + 3] = 0;
+      continue;
+    }
+    out[o] = rgb[0];
+    out[o + 1] = rgb[1];
+    out[o + 2] = rgb[2];
+    out[o + 3] = alpha;
+  }
+  return out;
+}
+
+export function hexToRgb(hex: string): [number, number, number] {
+  const h = hex.replace('#', '');
+  return [
+    parseInt(h.slice(0, 2), 16),
+    parseInt(h.slice(2, 4), 16),
+    parseInt(h.slice(4, 6), 16),
+  ];
+}
+
 export interface RasterizeOptions {
   min: number;
   max: number;
